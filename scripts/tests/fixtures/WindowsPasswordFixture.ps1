@@ -24,16 +24,18 @@ $passwordBox.Password = "fixture-secret"
 [void]$panel.Children.Add($userBox)
 [void]$panel.Children.Add($passwordBox)
 $window.Content = $panel
-$window.Add_ContentRendered({
-    [void]$window.Activate()
-    [void]$passwordBox.Focus()
-    [void][System.Windows.Input.Keyboard]::Focus($passwordBox)
-})
-$state = @{ user = ""; password = ""; passwordFocused = $false }
+$state = @{ user = ""; password = ""; passwordFocused = $false; focusTries = 0 }
 $stateEncoding = New-Object System.Text.UTF8Encoding($false)
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(50)
 $timer.Add_Tick({
+    # Keep asking for the foreground and the password box's focus for a few
+    # seconds after the window is up (as WindowsInputFixture's "focus" does).
+    if ($window.IsLoaded -and -not $passwordBox.IsKeyboardFocused -and $state.focusTries -lt 100) {
+        $state.focusTries += 1
+        [void]$window.Activate()
+        [void]$passwordBox.Focus()
+    }
     $state.user = $userBox.Text
     $state.password = $passwordBox.Password
     $state.passwordFocused = $passwordBox.IsKeyboardFocused

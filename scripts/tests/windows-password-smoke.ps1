@@ -83,7 +83,9 @@ try {
     Wait-For { (Read-State).user -eq "pi" } "user name update"
     Write-Output "set_value into the user name box still works."
 
-    if ((Read-State).passwordFocused) {
+    $focused = $true
+    try { Wait-For { (Read-State).passwordFocused } "password box keyboard focus" } catch { $focused = $false }
+    if ($focused) {
         $state = Call-Tool "get_app_state" @{ include_screenshot = $false }
         Assert ((Text $state) -match "focused UI element is .*\[password\]") ("Focused password box not marked:`n" + (Text $state))
         foreach ($call in @(@("type_text", @{ text = "typed-by-agent" }), @("press_key", @{ key = "a" }), @("press_key", @{ key = "shift+b" }))) {

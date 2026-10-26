@@ -86,7 +86,7 @@ type elementRecord struct {
 	Frame                *frame   `json:"frame,omitempty"`
 	Actions              []string `json:"actions,omitempty"`
 	// pi-phone fork: a password field (AT-SPI ROLE_PASSWORD_TEXT); its value is never read.
-	IsPassword           bool     `json:"isPassword,omitempty"`
+	IsPassword bool `json:"isPassword,omitempty"`
 }
 
 type appSnapshot struct {
