@@ -186,6 +186,54 @@ function Test-EnvFlagEnabled([string]$name) {
     return @("1", "true", "yes", "on") -contains $normalized
 }
 
+# pi-phone fork: password fields (UI Automation IsPassword) are marked in the
+# outline, their value is never read, and input into them is refused unless the
+# host opts out with OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT=1.
+$PasswordMarker = "[password]"
+
+function Test-ElementIsPassword($element) {
+    if ($null -eq $element) {
+        return $false
+    }
+    try {
+        return [bool]$element.Current.IsPassword
+    } catch {
+        return $false
+    }
+}
+
+function Assert-NotPasswordInput($element) {
+    if ((Test-ElementIsPassword $element) -and -not (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT")) {
+        throw "Refused: the target is a password field. Open Computer Use (pi-phone build) does not type into password fields; set OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT=1 to allow it."
+    }
+}
+
+function Get-FocusedElementOf($process) {
+    try {
+        $focused = [Windows.Automation.AutomationElement]::FocusedElement
+        if ($null -ne $focused -and $focused.Current.ProcessId -eq $process.Id) {
+            return $focused
+        }
+    } catch {
+    }
+    return $null
+}
+
+# Whether a press_key chord types a character (a, shift+a, space), not a command (ctrl+a, Return).
+function Test-KeyTypesCharacter([string]$key) {
+    $parts = @(([string]$key).Split("+") | Where-Object { $_ -ne "" })
+    if ($parts.Count -eq 0) {
+        return $false
+    }
+    for ($i = 0; $i -lt $parts.Count - 1; $i++) {
+        if ($parts[$i].ToLowerInvariant() -ne "shift") {
+            return $false
+        }
+    }
+    $main = $parts[$parts.Count - 1]
+    return ($main.Length -eq 1 -or $main.ToLowerInvariant() -eq "space" -or ($main.StartsWith("KP_") -and $main.Length -eq 4))
+}
+
 function New-Frame($x, $y, $width, $height) {
     if ($width -lt 0 -or $height -lt 0) {
         return $null
@@ -778,6 +826,9 @@ function Get-ElementRecord($element, [int]$index, $windowBounds, $TextLimit = $s
     $frame = Get-ElementFrame $element $windowBounds
     $runtimeId = @()
     try { $runtimeId = @($element.GetRuntimeId()) } catch {}
+    $isPassword = Test-ElementIsPassword $element
+    $value = ""
+    if (-not $isPassword) { $value = Get-ElementValue $element $TextLimit }
     [pscustomobject]@{
         index = $index
         runtimeId = $runtimeId
@@ -786,10 +837,11 @@ function Get-ElementRecord($element, [int]$index, $windowBounds, $TextLimit = $s
         controlType = Get-ElementControlTypeName $element
         localizedControlType = Get-ElementString $element "LocalizedControlType"
         className = Get-ElementString $element "ClassName"
-        value = Get-ElementValue $element $TextLimit
+        value = $value
         nativeWindowHandle = Get-ElementInt64 $element "NativeWindowHandle"
         frame = $frame
         actions = @(Get-PatternNames $element)
+        isPassword = $isPassword
     }
 }
 
@@ -831,6 +883,9 @@ function Render-Tree($element, $windowBounds, $TextLimit = $script:DefaultTextLi
             $role = $record.controlType
         }
         $title = Get-ElementTitle $record
+        if ($record.isPassword) {
+            $title = ("$title " + $PasswordMarker).Trim()
+        }
         $actionsSegment = ""
         if ($record.actions.Count -gt 0) {
             $actionsSegment = " Secondary Actions: " + ($record.actions -join ", ")
@@ -900,10 +955,11 @@ function Get-FocusedSummary($processId, $TextLimit = $script:DefaultTextLimit) {
         if ($null -ne $focused -and $focused.Current.ProcessId -eq $processId) {
             $role = $focused.Current.LocalizedControlType
             $name = Limit-Text $focused.Current.Name $TextLimit
-            if ([string]::IsNullOrWhiteSpace($name)) {
-                return $role
+            $summary = "$role $name".Trim()
+            if (Test-ElementIsPassword $focused) {
+                $summary = "$summary $PasswordMarker"
             }
-            return "$role $name"
+            return $summary
         }
     } catch {
     }
@@ -914,6 +970,9 @@ function Get-SelectedText($processId, $TextLimit = $script:DefaultTextLimit) {
     try {
         $focused = [Windows.Automation.AutomationElement]::FocusedElement
         if ($null -eq $focused -or $focused.Current.ProcessId -ne $processId) {
+            return $null
+        }
+        if (Test-ElementIsPassword $focused) {
             return $null
         }
         $textPattern = $focused.GetCurrentPattern([Windows.Automation.TextPattern]::Pattern)
@@ -1221,6 +1280,7 @@ function Find-TextEntryWindowHandle($process, $preferredElement) {
 
 function Invoke-TypeText($process, [string]$text) {
     $element = Find-TextEntryElement $process
+    Assert-NotPasswordInput $element
     $targetHwnd = Find-TextEntryWindowHandle $process $element
     if ($targetHwnd -ne [IntPtr]::Zero -and (Send-TextToEditHandle $targetHwnd $text $element)) {
         return $true
@@ -1353,14 +1413,19 @@ try {
             }
             "type_text" {
                 if (-not (Invoke-TypeText $process $operation.text)) {
+                    Assert-NotPasswordInput (Get-FocusedElementOf $process)
                     Send-Text $hwnd $operation.text
                 }
             }
             "press_key" {
+                if (Test-KeyTypesCharacter $operation.key) {
+                    Assert-NotPasswordInput (Get-FocusedElementOf $process)
+                }
                 Send-Key $hwnd $operation.key $operation.key_method
             }
             "set_value" {
                 if ($null -eq $element) { throw "unknown element_index '$($operation.element.index)'" }
+                Assert-NotPasswordInput $element
                 $valuePattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ValuePattern]::Pattern)
                 if ($null -eq $valuePattern) {
                     throw "Cannot set a value for an element that is not settable"

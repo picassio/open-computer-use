@@ -92,6 +92,8 @@ type elementRecord struct {
 	NativeWindowHandle   int64    `json:"nativeWindowHandle,omitempty"`
 	Frame                *frame   `json:"frame,omitempty"`
 	Actions              []string `json:"actions,omitempty"`
+	// pi-phone fork: a password field (UI Automation IsPassword); its value is never read.
+	IsPassword           bool     `json:"isPassword,omitempty"`
 }
 
 type appSnapshot struct {

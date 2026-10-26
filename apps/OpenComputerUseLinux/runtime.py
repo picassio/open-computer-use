@@ -28,6 +28,16 @@ MAX_ELEMENTS = 1200
 MAX_DEPTH = 64
 DEFAULT_TEXT_LIMIT = 500
 
+# pi-phone fork: password fields are marked in the outline, their text is never
+# read, and input into them is refused unless the host opts out with
+# OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT=1.
+PASSWORD_ROLE = "password text"
+PASSWORD_MARKER = "[password]"
+PASSWORD_REFUSAL = (
+    "Refused: the target is a password field. Open Computer Use (pi-phone build) does not type "
+    "into password fields; set OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT=1 to allow it."
+)
+
 
 def frame(x, y, width, height):
     if width is None or height is None or width < 0 or height < 0:
@@ -96,6 +106,35 @@ def limit_text(value, text_limit=DEFAULT_TEXT_LIMIT):
 
 def node_role(node):
     return str(safe(node.get_role_name, "") or "")
+
+
+def is_password(node):
+    """AT-SPI ROLE_PASSWORD_TEXT (GTK, Qt, Chromium and Firefox password inputs)."""
+    if node is None:
+        return False
+    try:
+        return node_role(node) == PASSWORD_ROLE
+    except Exception:
+        return False
+
+
+def password_input_allowed():
+    value = os.environ.get("OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def focused_node(root):
+    """The focused descendant of root, or None when there is none or it cannot be read."""
+    try:
+        focused_state = Atspi.StateType.FOCUSED
+        return find_first(root, lambda node: state_contains(node, focused_state))
+    except Exception:
+        return None
+
+
+def refuse_password_input(node):
+    if is_password(node) and not password_input_allowed():
+        raise RuntimeError(PASSWORD_REFUSAL)
 
 
 def node_pid(node):
@@ -275,6 +314,8 @@ def record_for(node, index, path, window_bounds, text_limit=DEFAULT_TEXT_LIMIT, 
     omit_details = showing is not None and not bool(showing)
     bounds = None if omit_details else relative_frame(node, window_bounds)
     role = node_role(node)
+    password = role == PASSWORD_ROLE
+    value = "" if omit_details or password else element_value(node, text_limit=text_limit)
     return {
         "index": index,
         "runtimeId": path[:],
@@ -283,11 +324,12 @@ def record_for(node, index, path, window_bounds, text_limit=DEFAULT_TEXT_LIMIT, 
         "controlType": role,
         "localizedControlType": role,
         "className": "" if omit_details else str(safe(node.get_toolkit_name, "") or ""),
-        "value": "" if omit_details else element_value(node, text_limit=text_limit),
+        "value": value,
         "nativeWindowHandle": 0,
         "frame": bounds,
         "actions": [] if omit_details else action_names(node),
         **({"detailsOmitted": True} if omit_details else {}),
+        **({"isPassword": True} if password else {}),
     }
 
 
@@ -307,6 +349,8 @@ def render_tree(root, window_bounds, root_path, text_limit=DEFAULT_TEXT_LIMIT, m
         title = record["name"] or record["automationId"] or ""
         if record.get("detailsOmitted"):
             title += " [hidden details omitted]"
+        if record.get("isPassword"):
+            title = (title + " " + PASSWORD_MARKER).strip()
         value_segment = ""
         if record["value"] and record["value"] != title:
             safe_value = record["value"].replace("\r", "\\r").replace("\n", "\\n")
@@ -428,6 +472,10 @@ def focus_details(window, text_limit=DEFAULT_TEXT_LIMIT, max_nodes=MAX_ELEMENTS,
         return None, None, truncated
     summary = (node_role(focused) + " " + limit_text(node_name(focused), text_limit)).strip()
     selection = None
+    if is_password(focused):
+        # The marker tells the host that typing now would go into a password field;
+        # its selection is never read.
+        return summary + " " + PASSWORD_MARKER, None, False
     if supports_interface(focused, "Text"):
         text_iface = safe(focused.get_text_iface)
         count = safe(lambda: Atspi.Text.get_n_selections(text_iface), 0)
@@ -721,6 +769,17 @@ def send_key(key):
             )
 
 
+def types_character(key):
+    """Whether a press_key chord types a character (a, shift+a, space), not a command (ctrl+a, Return)."""
+    parts = [part for part in str(key).split("+") if part]
+    if not parts:
+        return False
+    if any(part.lower() not in {"shift"} for part in parts[:-1]):
+        return False
+    main = parts[-1]
+    return len(main) == 1 or main.lower() in {"space"} or main.startswith("KP_") and len(main) == 4
+
+
 def send_text(text):
     Atspi.generate_keyboard_event(0, str(text), Atspi.KeySynthType.STRING)
 
@@ -735,9 +794,16 @@ def find_editable_text(root):
 
 
 def insert_text(root, text):
-    node = find_editable_text(root)
+    # pi-phone fork: the focused editable field first (the field the person or the
+    # agent clicked), then the first editable field, as before.
+    node = focused_node(root)
+    if node is None or not (
+        supports_interface(node, "EditableText") and supports_interface(node, "Text")
+    ):
+        node = find_editable_text(root)
     if node is None:
         return False
+    refuse_password_input(node)
     editable = safe(node.get_editable_text_iface)
     text_iface = safe(node.get_text_iface)
     if editable is None or text_iface is None:
@@ -887,12 +953,16 @@ def perform_operation(operation):
         send_drag(from_x, from_y, to_x, to_y)
     elif tool == "type_text":
         if not insert_text(window, operation.get("text", "")):
+            refuse_password_input(focused_node(window))
             send_text(operation.get("text", ""))
     elif tool == "press_key":
+        if types_character(operation.get("key", "")):
+            refuse_password_input(focused_node(window))
         send_key(operation.get("key", ""))
     elif tool == "set_value":
         if element is None:
             raise RuntimeError("unknown element_index")
+        refuse_password_input(element)
         if not set_element_value(element, operation.get("value", "")):
             raise RuntimeError("Cannot set a value for an element that is not settable")
     else:

@@ -469,5 +469,94 @@ class RuntimeActionReadBackTests(unittest.TestCase):
         self.snapshot.assert_not_called()
 
 
+class PasswordFieldTests(unittest.TestCase):
+    """pi-phone fork: password fields are marked, never read, and not typed into."""
+
+    def setUp(self):
+        self.runtime = load_runtime()
+        self.runtime.Atspi.StateType = types.SimpleNamespace(SHOWING="showing", FOCUSED="focused")
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.dict(self.runtime.os.environ, {}, clear=False))
+        self.runtime.os.environ.pop("OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT", None)
+
+    def node(self, role, name="", focused=False, children=()):
+        node = mock.Mock()
+        node.get_name.return_value = name
+        node.get_role_name.return_value = role
+        node.get_child_count.return_value = len(children)
+        node.get_child_at_index.side_effect = lambda index: children[index]
+        node.get_state_set.return_value.contains.side_effect = lambda state: focused and state == "focused"
+        return node
+
+    def test_password_line_is_marked_and_its_text_is_never_read(self):
+        secret = self.node("password text", "Password")
+        window = self.node("frame", "Sign in", children=(secret,))
+        with mock.patch.object(self.runtime, "relative_frame", return_value=None), \
+             mock.patch.object(self.runtime, "accessible_id", return_value=""), \
+             mock.patch.object(self.runtime, "element_value",
+                               side_effect=lambda node, **_: "hunter2" if node is secret else "") as value, \
+             mock.patch.object(self.runtime, "action_names", return_value=[]):
+            records, lines = self.runtime.render_tree(window, None, [0])
+        self.assertTrue(records[1]["isPassword"])
+        self.assertEqual(records[1]["value"], "")
+        self.assertNotIn("isPassword", records[0])
+        self.assertIn("1 password text Password [password]", lines[1])
+        self.assertNotIn("hunter2", "\n".join(lines))
+        self.assertEqual(value.call_count, 1)  # only the window's own value was read
+
+    def test_focused_password_summary_is_marked_without_selection(self):
+        secret = self.node("password text", "Password", focused=True)
+        window = self.node("frame", "Sign in", children=(secret,))
+        summary, selection, truncated = self.runtime.focus_details(window)
+        self.assertEqual(summary, "password text Password [password]")
+        self.assertIsNone(selection)
+        self.assertFalse(truncated)
+
+    def test_set_value_into_a_password_field_is_refused(self):
+        secret = self.node("password text", "Password")
+        with mock.patch.object(self.runtime, "resolve_app"), \
+             mock.patch.object(self.runtime, "main_window", return_value=(0, self.node("frame"))), \
+             mock.patch.object(self.runtime, "extents"), \
+             mock.patch.object(self.runtime, "find_element", return_value=secret), \
+             mock.patch.object(self.runtime, "set_element_value") as write:
+            with self.assertRaisesRegex(RuntimeError, "password field"):
+                self.runtime.perform_operation({"tool": "set_value", "app": "Editor", "element": {"index": 1}, "value": "x"})
+        write.assert_not_called()
+
+    def test_typing_into_a_focused_password_field_is_refused(self):
+        secret = self.node("password text", "Password", focused=True)
+        secret.get_interfaces.return_value = ["Accessible", "Text", "EditableText"]
+        window = self.node("frame", "Sign in", children=(secret,))
+        with mock.patch.object(self.runtime, "resolve_app"), \
+             mock.patch.object(self.runtime, "main_window", return_value=(0, window)), \
+             mock.patch.object(self.runtime, "extents"), \
+             mock.patch.object(self.runtime, "find_element", return_value=None), \
+             mock.patch.object(self.runtime, "send_text") as typed, \
+             mock.patch.object(self.runtime, "send_key") as pressed:
+            for operation in ({"tool": "type_text", "text": "hunter2"}, {"tool": "press_key", "key": "h"},
+                              {"tool": "press_key", "key": "shift+h"}):
+                with self.subTest(operation=operation):
+                    with self.assertRaisesRegex(RuntimeError, "password field"):
+                        self.runtime.perform_operation({"app": "Editor", "skip_read_back": True, **operation})
+            # Commands are still allowed: submitting or leaving the field.
+            for key in ("Return", "Tab", "ctrl+a"):
+                self.runtime.perform_operation({"app": "Editor", "skip_read_back": True, "tool": "press_key", "key": key})
+        typed.assert_not_called()
+        self.assertEqual([call.args[0] for call in pressed.call_args_list], ["Return", "Tab", "ctrl+a"])
+
+    def test_opt_out_allows_password_input(self):
+        secret = self.node("password text", "Password")
+        self.runtime.os.environ["OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT"] = "1"
+        self.addCleanup(self.runtime.os.environ.pop, "OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT", None)
+        self.runtime.refuse_password_input(secret)
+
+    def test_types_character(self):
+        for key, expected in (("a", True), ("shift+a", True), ("space", True), ("KP_0", True),
+                              ("Return", False), ("ctrl+a", False), ("alt+F4", False), ("BackSpace", False)):
+            with self.subTest(key=key):
+                self.assertEqual(self.runtime.types_character(key), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
