@@ -1,10 +1,8 @@
 name: release
 
+# pi-phone fork: upstream's macOS/npm release runs only by hand here; tags in this
+# fork (v*-pp.*) are built by pi-phone.yml.
 on:
-  push:
-    tags:
-      - "v*"
-      - "*.*.*"
   workflow_dispatch:
     inputs:
       publish_to_npm:

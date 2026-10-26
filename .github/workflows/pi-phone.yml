@@ -1,0 +1,123 @@
+name: pi-phone build
+
+# pi-phone fork (https://github.com/picassio/open-computer-use): tests the Linux and
+# Windows runtimes on every push to the pi-phone branch, and on a tag v*-pp.* also
+# builds linux-x64, linux-arm64 and windows-x64 binaries and publishes them as a
+# GitHub Release with SHA256SUMS, LICENSE and THIRD_PARTY_NOTICES.md. Nothing is
+# published to npm.
+
+on:
+  push:
+    branches:
+      - pi-phone
+    tags:
+      - "v*-pp.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.22.x"
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l apps/OpenComputerUseLinux apps/OpenComputerUseWindows)"
+          if [ -n "${unformatted}" ]; then echo "gofmt needed: ${unformatted}"; exit 1; fi
+      - name: Linux Go tests
+        working-directory: apps/OpenComputerUseLinux
+        run: go test ./...
+      - name: Linux runtime unit tests
+        working-directory: apps/OpenComputerUseLinux
+        run: python3 -m unittest -v runtime_test.py
+      - name: Windows runtime builds
+        working-directory: apps/OpenComputerUseWindows
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null .
+
+  test-windows:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: "24"
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.22.x"
+          cache: false
+      - name: Windows Go tests and build
+        working-directory: apps/OpenComputerUseWindows
+        run: |
+          go test ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go build -o "$env:RUNNER_TEMP/ocu.exe" .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: PowerShell collection branches
+        run: |
+          powershell.exe -NoProfile -NonInteractive -File ./scripts/tests/windows-observation.test.ps1 -RuntimePath apps/OpenComputerUseWindows/runtime.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Real WPF password-field guard (pi-phone)
+        run: ./scripts/tests/windows-password-smoke.ps1 -NativePath "$env:RUNNER_TEMP/ocu.exe"
+      - name: Real WPF and native MCP (upstream observation smoke)
+        run: ./scripts/tests/windows-observation-smoke.ps1 -NativePath "$env:RUNNER_TEMP/ocu.exe"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [test-linux, test-windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.22.x"
+      - name: Build binaries
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          out="${RUNNER_TEMP}/assets"
+          mkdir -p "${out}"
+          build() {
+            local module="$1" goos="$2" goarch="$3" name="$4"
+            (cd "apps/${module}" && GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 go build \
+              -trimpath -ldflags "-s -w -X main.version=${version}" -o "${out}/${name}" .)
+          }
+          build OpenComputerUseLinux linux amd64 open-computer-use-linux-x64
+          build OpenComputerUseLinux linux arm64 open-computer-use-linux-arm64
+          build OpenComputerUseWindows windows amd64 open-computer-use-windows-x64.exe
+          "${out}/open-computer-use-linux-x64" version | grep -qx "${version}"
+          cp LICENSE THIRD_PARTY_NOTICES.md PI-PHONE.md "${out}/"
+          (cd "${out}" && sha256sum open-computer-use-* LICENSE THIRD_PARTY_NOTICES.md PI-PHONE.md > SHA256SUMS)
+          cat "${out}/SHA256SUMS"
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/assets"
+          {
+            echo "pi-phone build of [open-computer-use](https://github.com/iFurySt/open-computer-use) (MIT, Copyright (c) 2026 Leo), from \`${GITHUB_SHA}\`."
+            echo
+            echo "Changes for pi-phone: see [PI-PHONE.md](https://github.com/${GITHUB_REPOSITORY}/blob/${TAG}/PI-PHONE.md)."
+            echo
+            echo '```'
+            cat "${out}/SHA256SUMS"
+            echo '```'
+          } > "${RUNNER_TEMP}/notes.md"
+          gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --title "${TAG} (pi-phone)" \
+            --notes-file "${RUNNER_TEMP}/notes.md" --prerelease=false "${out}"/*
