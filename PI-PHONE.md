@@ -16,7 +16,8 @@ The fork's work is on the `pi-phone` branch. `main` follows upstream.
   - The focused-element summary carries the same marker.
   - Their value and selection are never read. Element records carry `isPassword: true`.
   - `set_value`, `type_text`, and character keys from `press_key` (`a`, `shift+a`, `space`) are refused when the target or the focused element is a password field. Command keys (`Return`, `Tab`, `ctrl+a`) still work.
-  - A host may opt out with `OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT=1`.
+  - One call may opt out with `allow_password_input: true` on `set_value`, `type_text` or `press_key` (pi-phone sets it only for the owner typing on a taken-over window, and for a saved secret filled by name); every other call keeps the guard. Anything but a boolean `true` is no opt-out.
+  - A host may opt out for every call with `OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT=1`.
 - **Linux `type_text`:** writes into the focused editable field first, then the first editable field, as upstream did.
 - **Releases:**
   - `.github/workflows/pi-phone.yml` tests both runtimes, including a real WPF password-box smoke on Windows.

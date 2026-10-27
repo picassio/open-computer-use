@@ -97,6 +97,21 @@ try {
     } else {
         Write-Warning "The password box did not get keyboard focus on this desktop; focused-typing checks skipped."
     }
+
+    # A call with allow_password_input: true (the person typing their own password) goes in; the next call without it
+    # is refused again.
+    $state = Call-Tool "get_app_state" @{ include_screenshot = $false }
+    $passwordIndex = Index-Of $state 'edit Password \[password\](?:\s|$)'
+    $allowedSet = Call-Tool "set_value" @{ element_index = $passwordIndex; value = "typed-by-person"; allow_password_input = $true }
+    Assert (-not $allowedSet.isError) ("set_value with allow_password_input was refused: " + (Text $allowedSet))
+    Wait-For { (Read-State).password -eq "typed-by-person" } "password box update with allow_password_input"
+    Assert ((Text $allowedSet) -notmatch "typed-by-person") "The password's value is in the result"
+    $state = Call-Tool "get_app_state" @{ include_screenshot = $false }
+    $passwordIndex = Index-Of $state 'edit Password \[password\](?:\s|$)'
+    $again = Call-Tool "set_value" @{ element_index = $passwordIndex; value = "typed-by-agent" }
+    Assert ($again.isError -and (Text $again) -match "password field") ("The next set_value without the flag was not refused: " + (Text $again))
+    Assert ((Read-State).password -eq "typed-by-person") "The password box changed without the flag"
+    Write-Output "set_value with allow_password_input goes in; the next call without it is refused."
     Write-Output "Windows password-field guard passed."
 } finally {
     if ($null -ne $native -and -not $native.HasExited) {

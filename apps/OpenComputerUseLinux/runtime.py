@@ -132,8 +132,9 @@ def focused_node(root):
         return None
 
 
-def refuse_password_input(node):
-    if is_password(node) and not password_input_allowed():
+def refuse_password_input(node, allowed=False):
+    """allowed: this call opted out (allow_password_input), a person typing their own password."""
+    if is_password(node) and not allowed and not password_input_allowed():
         raise RuntimeError(PASSWORD_REFUSAL)
 
 
@@ -793,7 +794,7 @@ def find_editable_text(root):
     return find_first(root, is_editable)
 
 
-def insert_text(root, text):
+def insert_text(root, text, allow_password=False):
     # pi-phone fork: the focused editable field first (the field the person or the
     # agent clicked), then the first editable field, as before.
     node = focused_node(root)
@@ -803,7 +804,7 @@ def insert_text(root, text):
         node = find_editable_text(root)
     if node is None:
         return False
-    refuse_password_input(node)
+    refuse_password_input(node, allow_password)
     editable = safe(node.get_editable_text_iface)
     text_iface = safe(node.get_text_iface)
     if editable is None or text_iface is None:
@@ -894,6 +895,8 @@ def perform_operation(operation):
     bounds = operation.get("windowBounds") or extents(window)
     element_record = operation.get("element")
     element = find_element(app, element_record)
+    # pi-phone fork: only this call's own opt-out counts (exactly true), never a default.
+    allow_password = operation.get("allow_password_input") is True
 
     if tool == "click":
         click_method = (operation.get("click_method") or "auto").lower()
@@ -952,17 +955,17 @@ def perform_operation(operation):
         to_x, to_y = screen_point(bounds, None, operation.get("to_x"), operation.get("to_y"))
         send_drag(from_x, from_y, to_x, to_y)
     elif tool == "type_text":
-        if not insert_text(window, operation.get("text", "")):
-            refuse_password_input(focused_node(window))
+        if not insert_text(window, operation.get("text", ""), allow_password):
+            refuse_password_input(focused_node(window), allow_password)
             send_text(operation.get("text", ""))
     elif tool == "press_key":
         if types_character(operation.get("key", "")):
-            refuse_password_input(focused_node(window))
+            refuse_password_input(focused_node(window), allow_password)
         send_key(operation.get("key", ""))
     elif tool == "set_value":
         if element is None:
             raise RuntimeError("unknown element_index")
-        refuse_password_input(element)
+        refuse_password_input(element, allow_password)
         if not set_element_value(element, operation.get("value", "")):
             raise RuntimeError("Cannot set a value for an element that is not settable")
     else:

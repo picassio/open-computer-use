@@ -24,6 +24,46 @@ func TestActionPinsObservedWindowAndForwardsKeyboardMethod(t *testing.T) {
 	}
 }
 
+// pi-phone fork: allow_password_input reaches the bridge only on the call that sets it, only as true.
+func TestAllowPasswordInputIsPerCall(t *testing.T) {
+	cases := []struct {
+		tool string
+		args map[string]any
+		want bool
+	}{
+		{"type_text", map[string]any{"text": "x", "allow_password_input": true}, true},
+		{"type_text", map[string]any{"text": "x"}, false},
+		{"press_key", map[string]any{"key": "a", "allow_password_input": true}, true},
+		{"press_key", map[string]any{"key": "a", "allow_password_input": false}, false},
+		{"set_value", map[string]any{"element_index": "0", "value": "x", "allow_password_input": true}, true},
+		{"set_value", map[string]any{"element_index": "0", "value": "x"}, false},
+	}
+	for _, c := range cases {
+		svc := newService()
+		svc.rememberSnapshot("fixture", &appSnapshot{App: appDescriptor{Name: "fixture", PID: 42}, WindowHandle: 1234, Elements: []elementRecord{{Index: 0}}})
+		var request psRequest
+		svc.runBridge = func(r psRequest) (*psResponse, error) {
+			request = r
+			return &psResponse{OK: true, Snapshot: &appSnapshot{App: appDescriptor{Name: "fixture", PID: 42}, WindowHandle: 1234}}, nil
+		}
+		args := map[string]any{"app": "fixture"}
+		for key, value := range c.args {
+			args[key] = value
+		}
+		if result := svc.callTool(c.tool, args); result.IsError {
+			t.Fatalf("%s %v: %#v", c.tool, c.args, result)
+		}
+		if request.AllowPasswordInput != c.want {
+			t.Fatalf("%s %v: bridge request %#v", c.tool, c.args, request)
+		}
+	}
+	svc := newService()
+	svc.rememberSnapshot("fixture", &appSnapshot{App: appDescriptor{Name: "fixture", PID: 42}})
+	if result := svc.callTool("type_text", map[string]any{"app": "fixture", "text": "x", "allow_password_input": "yes"}); !result.IsError {
+		t.Fatalf("a non-boolean allow_password_input was taken: %#v", result)
+	}
+}
+
 func TestGlobalClickNeedsImageEvenWhenElementIndexExists(t *testing.T) {
 	t.Setenv("OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS", "1")
 	svc := newService()

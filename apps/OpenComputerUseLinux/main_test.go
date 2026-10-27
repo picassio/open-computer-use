@@ -54,7 +54,7 @@ func TestActionWithoutReadBackPreservesObservedSnapshot(t *testing.T) {
 	s := newService()
 	observed := &appSnapshot{App: appDescriptor{Name: "Editor", PID: 42}, Elements: []elementRecord{{Index: 7}}}
 	s.rememberSnapshot("Editor", observed)
-	result := s.pressKey("Editor", "Return", "auto")
+	result := s.pressKey("Editor", "Return", "auto", false)
 	if result.IsError || len(result.Content) != 1 || result.Content[0].Text != "ok" {
 		t.Fatalf("action result = %#v", result)
 	}
@@ -81,7 +81,7 @@ func TestActionReadBackStillRefreshesSnapshotByDefault(t *testing.T) {
 	requestPath := fakePythonResponse(t, `{"ok":true,"snapshot":{"app":{"name":"Editor","pid":42},"treeLines":["updated"],"screenshotPngBase64":"aW1hZ2U="}}`)
 	s := newService()
 	s.rememberSnapshot("Editor", &appSnapshot{App: appDescriptor{Name: "Editor", PID: 42}})
-	result := s.pressKey("Editor", "Return", "auto")
+	result := s.pressKey("Editor", "Return", "auto", false)
 	if result.IsError || len(result.Content) != 2 || result.Content[1].Type != "image" {
 		t.Fatalf("default action result = %#v", result)
 	}
@@ -213,7 +213,7 @@ func TestScreenshotOnlyInvalidatesIndexesAcrossWindowAndProcessChanges(t *testin
 			if _, err := lookupElement(s.currentSnapshot("Editor"), "7"); err == nil {
 				t.Fatal("stale index remains usable")
 			}
-			if result := s.setValue("Editor", "7", "bad"); !result.IsError {
+			if result := s.setValue("Editor", "7", "bad", false); !result.IsError {
 				t.Fatal("stale element action accepted")
 			}
 			x, y := 10.0, 20.0
@@ -602,6 +602,57 @@ func listenUnixSocket(t *testing.T, path string) {
 	})
 }
 
+// pi-phone fork: allow_password_input reaches the runtime only on the call that sets it, only as true.
+func TestAllowPasswordInputIsPerCall(t *testing.T) {
+	t.Setenv("OPEN_COMPUTER_USE_ACTION_READ_BACK", "0")
+	for _, name := range []string{"set_value", "type_text", "press_key"} {
+		properties := findToolDefinition(t, name).InputSchema["properties"].(map[string]any)
+		if _, ok := properties["allow_password_input"]; !ok {
+			t.Fatalf("%s has no allow_password_input in its schema", name)
+		}
+	}
+	cases := []struct {
+		tool string
+		args map[string]any
+		want bool
+	}{
+		{"type_text", map[string]any{"text": "x", "allow_password_input": true}, true},
+		{"type_text", map[string]any{"text": "x"}, false},
+		{"press_key", map[string]any{"key": "a", "allow_password_input": true}, true},
+		{"press_key", map[string]any{"key": "a", "allow_password_input": false}, false},
+		{"set_value", map[string]any{"element_index": "7", "value": "x", "allow_password_input": true}, true},
+		{"set_value", map[string]any{"element_index": "7", "value": "x"}, false},
+	}
+	for _, c := range cases {
+		requestPath := fakePythonResponse(t, `{"ok":true}`)
+		s := newService()
+		s.rememberSnapshot("Editor", &appSnapshot{App: appDescriptor{Name: "Editor", PID: 42}, Elements: []elementRecord{{Index: 7}}})
+		args := map[string]any{"app": "Editor"}
+		for key, value := range c.args {
+			args[key] = value
+		}
+		if result := s.callTool(c.tool, args); result.IsError {
+			t.Fatalf("%s %v: %#v", c.tool, c.args, result)
+		}
+		data, err := os.ReadFile(requestPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var request linuxRequest
+		if err := json.Unmarshal(data, &request); err != nil {
+			t.Fatal(err)
+		}
+		if request.AllowPasswordInput != c.want || strings.Contains(string(data), "allow_password_input") != c.want {
+			t.Fatalf("%s %v: bridge request %s", c.tool, c.args, data)
+		}
+	}
+	s := newService()
+	s.rememberSnapshot("Editor", &appSnapshot{App: appDescriptor{Name: "Editor", PID: 42}})
+	if result := s.callTool("type_text", map[string]any{"app": "Editor", "text": "x", "allow_password_input": "yes"}); !result.IsError {
+		t.Fatalf("a non-boolean allow_password_input was taken: %#v", result)
+	}
+}
+
 func findToolDefinition(t *testing.T, name string) toolDefinition {
 	t.Helper()
 	for _, tool := range toolDefinitions() {
@@ -647,11 +698,11 @@ func TestLinuxKeyMethodSchemaAndUnsupportedSkyKey(t *testing.T) {
 	}
 
 	service := newService()
-	result := service.typeText("Text Editor", "hello", "sky_key")
+	result := service.typeText("Text Editor", "hello", "sky_key", false)
 	if !result.IsError || result.Content[0].Text != "key_method 'sky_key' is not supported on Linux" {
 		t.Fatalf("type_text sky_key result = %#v", result)
 	}
-	result = service.pressKey("Text Editor", "Return", "sky_key")
+	result = service.pressKey("Text Editor", "Return", "sky_key", false)
 	if !result.IsError || result.Content[0].Text != "key_method 'sky_key' is not supported on Linux" {
 		t.Fatalf("press_key sky_key result = %#v", result)
 	}

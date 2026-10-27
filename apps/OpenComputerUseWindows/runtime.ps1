@@ -202,8 +202,12 @@ function Test-ElementIsPassword($element) {
     }
 }
 
+# pi-phone fork: set for one call when it carries allow_password_input: true (a person
+# typing their own password); every other call keeps the guard.
+$script:AllowPasswordInputThisCall = $false
+
 function Assert-NotPasswordInput($element) {
-    if ((Test-ElementIsPassword $element) -and -not (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT")) {
+    if ((Test-ElementIsPassword $element) -and -not $script:AllowPasswordInputThisCall -and -not (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT")) {
         throw "Refused: the target is a password field. Open Computer Use (pi-phone build) does not type into password fields; set OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT=1 to allow it."
     }
 }
@@ -1323,6 +1327,7 @@ try {
         }
         $windowBounds = $operation.windowBounds
         $element = Find-Element $process $operation.element
+        $script:AllowPasswordInputThisCall = ($operation.allow_password_input -is [bool]) -and $operation.allow_password_input
 
         switch ($operation.tool) {
             "click" {

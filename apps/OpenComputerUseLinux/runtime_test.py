@@ -545,6 +545,34 @@ class PasswordFieldTests(unittest.TestCase):
         typed.assert_not_called()
         self.assertEqual([call.args[0] for call in pressed.call_args_list], ["Return", "Tab", "ctrl+a"])
 
+    def test_a_call_that_allows_password_input_types_there(self):
+        secret = self.node("password text", "Password", focused=True)
+        # Not editable through AT-SPI: type_text falls back to keystrokes into the focused field.
+        secret.get_interfaces.return_value = ["Accessible", "Text"]
+        window = self.node("frame", "Sign in", children=(secret,))
+        window.get_interfaces.return_value = ["Accessible"]
+        with mock.patch.object(self.runtime, "resolve_app"), \
+             mock.patch.object(self.runtime, "main_window", return_value=(0, window)), \
+             mock.patch.object(self.runtime, "extents"), \
+             mock.patch.object(self.runtime, "find_element", return_value=secret), \
+             mock.patch.object(self.runtime, "set_element_value", return_value=True) as write, \
+             mock.patch.object(self.runtime, "send_text") as typed, \
+             mock.patch.object(self.runtime, "send_key") as pressed:
+            for operation in ({"tool": "type_text", "text": "hunter2"}, {"tool": "press_key", "key": "h"},
+                              {"tool": "set_value", "element": {"index": 1}, "value": "hunter2"}):
+                with self.subTest(operation=operation):
+                    self.runtime.perform_operation({"app": "Editor", "skip_read_back": True,
+                                                    "allow_password_input": True, **operation})
+            # Only exactly true opts out: anything else keeps the guard.
+            for allow in (False, "true", 1, None):
+                with self.subTest(allow=allow):
+                    with self.assertRaisesRegex(RuntimeError, "password field"):
+                        self.runtime.perform_operation({"app": "Editor", "skip_read_back": True, "tool": "type_text",
+                                                        "text": "x", "allow_password_input": allow})
+        typed.assert_called_once_with("hunter2")
+        pressed.assert_called_once_with("h")
+        write.assert_called_once_with(secret, "hunter2")
+
     def test_opt_out_allows_password_input(self):
         secret = self.node("password text", "Password")
         self.runtime.os.environ["OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT"] = "1"

@@ -233,6 +233,10 @@ type psRequest struct {
 	TextLimit         any            `json:"text_limit,omitempty"`
 	MaxTreeNodes      int            `json:"max_tree_nodes,omitempty"`
 	MaxTreeDepth      int            `json:"max_tree_depth,omitempty"`
+
+	// pi-phone fork: this call may type into a password field (the host's person typing
+	// it themselves); without it the guard refuses, unless OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT.
+	AllowPasswordInput bool `json:"allow_password_input,omitempty"`
 }
 
 type textLimit struct {
@@ -339,15 +343,27 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 		if err != nil {
 			return textResult(err.Error(), true)
 		}
-		return s.typeText(requiredString(args, "app"), requiredString(args, "text"), keyMethod)
+		allowPassword, err := allowPasswordInput(args)
+		if err != nil {
+			return textResult(err.Error(), true)
+		}
+		return s.typeText(requiredString(args, "app"), requiredString(args, "text"), keyMethod, allowPassword)
 	case "press_key":
 		keyMethod, err := parsePressKeyMethod(optionalString(args, "key_method"))
 		if err != nil {
 			return textResult(err.Error(), true)
 		}
-		return s.pressKey(requiredString(args, "app"), requiredString(args, "key"), keyMethod)
+		allowPassword, err := allowPasswordInput(args)
+		if err != nil {
+			return textResult(err.Error(), true)
+		}
+		return s.pressKey(requiredString(args, "app"), requiredString(args, "key"), keyMethod, allowPassword)
 	case "set_value":
-		return s.setValue(requiredString(args, "app"), requiredElementIndex(args), requiredString(args, "value"))
+		allowPassword, err := allowPasswordInput(args)
+		if err != nil {
+			return textResult(err.Error(), true)
+		}
+		return s.setValue(requiredString(args, "app"), requiredElementIndex(args), requiredString(args, "value"), allowPassword)
 	default:
 		return textResult(fmt.Sprintf("unsupportedTool(%q)", name), true)
 	}
@@ -511,7 +527,7 @@ func screenshotCoordinatesUnavailableResult(app string) toolCallResult {
 	return textResult("No usable screenshot is available for "+app+". Run get_app_state with include_screenshot=true on a visible, non-minimized, on-screen window before using screenshot coordinates.", true)
 }
 
-func (s *service) typeText(app, text, keyMethod string) toolCallResult {
+func (s *service) typeText(app, text, keyMethod string, allowPassword bool) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
@@ -524,10 +540,10 @@ func (s *service) typeText(app, text, keyMethod string) toolCallResult {
 	if s.currentSnapshot(app) == nil {
 		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
 	}
-	return s.actionResult(app, psRequest{Tool: "type_text", App: app, Text: text})
+	return s.actionResult(app, psRequest{Tool: "type_text", App: app, Text: text, AllowPasswordInput: allowPassword})
 }
 
-func (s *service) pressKey(app, key, keyMethod string) toolCallResult {
+func (s *service) pressKey(app, key, keyMethod string, allowPassword bool) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
@@ -543,10 +559,10 @@ func (s *service) pressKey(app, key, keyMethod string) toolCallResult {
 	if s.currentSnapshot(app) == nil {
 		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
 	}
-	return s.actionResult(app, psRequest{Tool: "press_key", App: app, Key: key, KeyMethod: keyMethod})
+	return s.actionResult(app, psRequest{Tool: "press_key", App: app, Key: key, KeyMethod: keyMethod, AllowPasswordInput: allowPassword})
 }
 
-func (s *service) setValue(app, elementIndex, value string) toolCallResult {
+func (s *service) setValue(app, elementIndex, value string, allowPassword bool) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
@@ -561,7 +577,7 @@ func (s *service) setValue(app, elementIndex, value string) toolCallResult {
 	if err != nil {
 		return textResult(err.Error(), true)
 	}
-	return s.actionResult(app, psRequest{Tool: "set_value", App: app, Element: record, Value: value})
+	return s.actionResult(app, psRequest{Tool: "set_value", App: app, Element: record, Value: value, AllowPasswordInput: allowPassword})
 }
 
 func (s *service) actionResult(app string, request psRequest) toolCallResult {
@@ -706,6 +722,16 @@ func optionalBool(args map[string]any, key string) (*bool, error) {
 		return nil, fmt.Errorf("%s must be a boolean", key)
 	}
 	return &boolean, nil
+}
+
+// pi-phone fork: allow_password_input on set_value, type_text and press_key lets that one
+// call type into a password field; every other call keeps the guard.
+func allowPasswordInput(args map[string]any) (bool, error) {
+	value, err := optionalBool(args, "allow_password_input")
+	if err != nil || value == nil {
+		return false, err
+	}
+	return *value, nil
 }
 
 func requiredElementIndex(args map[string]any) string {
@@ -982,9 +1008,10 @@ func toolDefinitions() []toolDefinition {
 			Description: "Press a key or key-combination on the keyboard, including modifier and navigation keys.\n  - This supports xdotool's `key` syntax.\n  - Examples: \"a\", \"Return\", \"Tab\", \"super+c\", \"Up\", \"KP_0\" (for the numpad 0). This tool is part of plugin `Computer Use`.",
 			Annotations: defaultAnnotations(),
 			InputSchema: objectSchema(map[string]any{
-				"app":        stringProperty("App name or bundle identifier"),
-				"key":        stringProperty("Key or key-combination to press"),
-				"key_method": enumStringProperty("Keyboard delivery: auto (default window messages), global (real keys, requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1), or macOS-only sky_key (unsupported on Windows).", pressKeyMethodValues),
+				"app":                  stringProperty("App name or bundle identifier"),
+				"key":                  stringProperty("Key or key-combination to press"),
+				"key_method":           enumStringProperty("Keyboard delivery: auto (default window messages), global (real keys, requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1), or macOS-only sky_key (unsupported on Windows).", pressKeyMethodValues),
+				"allow_password_input": allowPasswordProperty,
 			}, []string{"app", "key"}),
 		},
 		{
@@ -1003,9 +1030,10 @@ func toolDefinitions() []toolDefinition {
 			Description: "Set the value of a settable accessibility element. This tool is part of plugin `Computer Use`.",
 			Annotations: defaultAnnotations(),
 			InputSchema: objectSchema(map[string]any{
-				"app":           stringProperty("App name or bundle identifier"),
-				"element_index": stringProperty("Element identifier"),
-				"value":         stringProperty("Value to assign"),
+				"app":                  stringProperty("App name or bundle identifier"),
+				"element_index":        stringProperty("Element identifier"),
+				"value":                stringProperty("Value to assign"),
+				"allow_password_input": allowPasswordProperty,
 			}, []string{"app", "element_index", "value"}),
 		},
 		{
@@ -1013,12 +1041,20 @@ func toolDefinitions() []toolDefinition {
 			Description: "Type literal text using keyboard input. This tool is part of plugin `Computer Use`.",
 			Annotations: defaultAnnotations(),
 			InputSchema: objectSchema(map[string]any{
-				"app":        stringProperty("App name or bundle identifier"),
-				"text":       stringProperty("Literal text to type"),
-				"key_method": enumStringProperty("Keyboard delivery: auto (default) or sky_key. sky_key is the macOS SkyLight background-window path and is not supported on Windows.", keyMethodValues),
+				"app":                  stringProperty("App name or bundle identifier"),
+				"text":                 stringProperty("Literal text to type"),
+				"key_method":           enumStringProperty("Keyboard delivery: auto (default) or sky_key. sky_key is the macOS SkyLight background-window path and is not supported on Windows.", keyMethodValues),
+				"allow_password_input": allowPasswordProperty,
 			}, []string{"app", "text"}),
 		},
 	}
+}
+
+// pi-phone fork: the per-call opt-out of the password-field guard.
+var allowPasswordProperty = map[string]any{
+	"type":        "boolean",
+	"default":     false,
+	"description": "pi-phone build: allow this call to type into a password field. Only for a person typing their own password; agents never set it.",
 }
 
 func objectSchema(properties map[string]any, required []string) map[string]any {

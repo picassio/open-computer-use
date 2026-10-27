@@ -467,11 +467,11 @@ func TestWindowsKeyMethodSchemaAndUnsupportedSkyKey(t *testing.T) {
 	}
 
 	service := newService()
-	result := service.typeText("Notepad", "hello", "sky_key")
+	result := service.typeText("Notepad", "hello", "sky_key", false)
 	if !result.IsError || result.Content[0].Text != "key_method 'sky_key' is not supported on Windows" {
 		t.Fatalf("type_text sky_key result = %#v", result)
 	}
-	result = service.pressKey("Notepad", "Return", "sky_key")
+	result = service.pressKey("Notepad", "Return", "sky_key", false)
 	if !result.IsError || result.Content[0].Text != "key_method 'sky_key' is not supported on Windows" {
 		t.Fatalf("press_key sky_key result = %#v", result)
 	}

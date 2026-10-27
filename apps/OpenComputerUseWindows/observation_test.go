@@ -83,7 +83,7 @@ func TestObservationInvalidatesOlderAliasesAcrossProcessReplacement(t *testing.T
 	if s.currentSnapshot("older-query") != nil || s.currentSnapshot("42") != nil || s.currentSnapshot("Other") != other {
 		t.Fatal("stale aliases retained or unrelated app invalidated")
 	}
-	if result := s.setValue("Editor", "7", "bad"); !result.IsError {
+	if result := s.setValue("Editor", "7", "bad", false); !result.IsError {
 		t.Fatal("stale element action accepted")
 	}
 	x, y := 10.0, 20.0
@@ -99,7 +99,7 @@ func TestObservationInvalidatesOlderAliasesAcrossProcessReplacement(t *testing.T
 	if result := s.click("Editor", "", &x, &y, 1, "left", "auto"); !result.IsError {
 		t.Fatal("AX-only observation accepted screenshot coordinates")
 	}
-	if result := s.setValue("Editor", "8", "works"); result.IsError {
+	if result := s.setValue("Editor", "8", "works", false); result.IsError {
 		t.Fatal("AX-only element action failed", result)
 	}
 }
