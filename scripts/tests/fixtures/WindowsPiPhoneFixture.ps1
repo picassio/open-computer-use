@@ -11,7 +11,8 @@ param(
 # the check box and the last button clicked; commands in "$StatePath.command" (JSON {sequence, kind})
 # reorder the same buttons (reverse), replace them with new ones in reverse order (rebuild), or close
 # the window and open a new one with the same title (reopen).
-# With -Cover: "OCU Cover Fixture", a plain red topmost window at Left/Top/Width/Height, to cover it.
+# With -Cover: "OCU Cover Fixture", a plain red topmost window at Left/Top/Width/Height, to cover it. Its
+# state file says when it is loaded and visible, with its window handle.
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName PresentationFramework
 $stateEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -31,8 +32,23 @@ if ($Cover) {
     $window.WindowStartupLocation = "Manual"
     $window.Left = $Left; $window.Top = $Top; $window.Width = $Width; $window.Height = $Height
     $window.Topmost = $true
+    $window.ShowActivated = $false
     $window.Background = [System.Windows.Media.Brushes]::Red
-    $window.Add_ContentRendered({ Write-State @{ ready = $true } })
+    # A window without content never raises ContentRendered: give it a red surface to paint, and
+    # report readiness from the dispatcher once WPF says the window is loaded and visible.
+    $surface = New-Object System.Windows.Controls.Border
+    $surface.Background = [System.Windows.Media.Brushes]::Red
+    $window.Content = $surface
+    $coverTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $coverTimer.Interval = [TimeSpan]::FromMilliseconds(100)
+    $coverTimer.Add_Tick({
+        if ($window.IsLoaded -and $window.IsVisible) {
+            $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper($window)).Handle
+            Write-State @{ ready = $true; hwnd = [long]$hwnd }
+            $coverTimer.Stop()
+        }
+    })
+    $window.Add_Loaded({ $coverTimer.Start() })
     $application.ShutdownMode = "OnMainWindowClose"
     [void]$application.Run($window)
     return

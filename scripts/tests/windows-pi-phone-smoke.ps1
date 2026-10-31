@@ -11,6 +11,22 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "windows-fixture-state.ps1")
 if ($env:OS -ne "Windows_NT") { throw "Windows desktop required" }
 Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class PiPhoneSmokeWin32 {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    public static string Describe(long handle) {
+        IntPtr hWnd = new IntPtr(handle);
+        RECT rect;
+        bool known = GetWindowRect(hWnd, out rect);
+        return "window " + handle + " visible=" + IsWindowVisible(hWnd) + (known ? " rect=" + rect.Left + "," + rect.Top + "," + rect.Right + "," + rect.Bottom : " rect=unknown");
+    }
+}
+"@
 $NativePath = (Resolve-Path -LiteralPath $NativePath).Path
 $directory = Join-Path ([System.IO.Path]::GetTempPath()) ("ocu-pi-phone-" + [Guid]::NewGuid())
 [void](New-Item -ItemType Directory -Path $directory)
@@ -18,6 +34,7 @@ $stateFile = Join-Path $directory "state.json"
 $fixtureSource = Join-Path $PSScriptRoot "fixtures/WindowsPiPhoneFixture.ps1"
 $fixture = $null
 $cover = $null
+$coverHandle = 0
 $native = $null
 $requestId = 0
 $sequence = 0
@@ -76,11 +93,33 @@ function Change-Window($kind) {
 }
 function Start-Cover($left, $top, $width, $height) {
     if ($null -ne $script:cover -and -not $script:cover.HasExited) { $script:cover.Kill(); $script:cover.WaitForExit() }
-    $coverState = Join-Path $directory ("cover-" + [Guid]::NewGuid() + ".json")
+    $name = "cover-" + [Guid]::NewGuid()
+    $coverState = Join-Path $directory "$name.json"
+    $coverError = Join-Path $directory "$name.err"
     $script:cover = Start-Process powershell.exe -ArgumentList @("-NoProfile", "-STA", "-File", "`"$fixtureSource`"", "-StatePath", "`"$coverState`"", "-Cover",
-        "-Left", $left, "-Top", $top, "-Width", $width, "-Height", $height) -PassThru
-    Wait-For { Test-Path -LiteralPath $coverState } "cover window"
-    Start-Sleep -Milliseconds 500
+        "-Left", $left, "-Top", $top, "-Width", $width, "-Height", $height) -PassThru -RedirectStandardOutput (Join-Path $directory "$name.out") -RedirectStandardError $coverError
+    try {
+        Wait-For { $script:cover.HasExited -or ((Test-Path -LiteralPath $coverState) -and (Read-WindowsFixtureState $coverState).ready) } "cover window"
+    } catch {
+        throw "The cover window did not come up: $($_.Exception.Message). $(Get-Content -Raw -LiteralPath $coverError -ErrorAction SilentlyContinue)"
+    }
+    if ($script:cover.HasExited) { throw "The cover window exited ($($script:cover.ExitCode)): $(Get-Content -Raw -LiteralPath $coverError -ErrorAction SilentlyContinue)" }
+    $script:coverHandle = [long](Read-WindowsFixtureState $coverState).hwnd
+    Wait-For { [PiPhoneSmokeWin32]::IsWindowVisible([IntPtr]$script:coverHandle) } "visible cover window"
+}
+# Read the fixture until the text matches (the window manager and DWM may take a moment after the
+# cover window shows); the last read is returned whatever it says, and the caller asserts on it.
+function Read-Until($pattern, $arguments = @{}) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        $result = Call-Tool "get_app_state" $arguments.Clone()
+        if (-not $result.isError -and (Text $result) -match $pattern) { return $result }
+        Start-Sleep -Milliseconds 300
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $result
+}
+function Describe-Windows {
+    "cover " + [PiPhoneSmokeWin32]::Describe($script:coverHandle) + "; fixture " + [PiPhoneSmokeWin32]::Describe([long](Get-Process -Id $fixture.Id).MainWindowHandle)
 }
 function Get-Pixels($result) {
     $image = Image $result
@@ -165,10 +204,10 @@ try {
 
     # A window over part of the fixture.
     Start-Cover 380 180 250 150
-    $covered = Call-Tool "get_app_state" @{}
+    $covered = Read-Until "(?m)^Covered: \["
     Assert (-not $covered.isError) (Text $covered)
     $match = [regex]::Match((Text $covered), "(?m)^Covered: \[\{x: (\d+), y: (\d+), width: (\d+), height: (\d+)\}")
-    Assert $match.Success ("No Covered: line with the cover window over the fixture:`n" + (Text $covered))
+    Assert $match.Success ("No Covered: line with the cover window over the fixture ($(Describe-Windows)):`n" + (Text $covered))
     $x, $y, $width, $height = 1..4 | ForEach-Object { [int]$match.Groups[$_].Value }
     $bitmap = Get-Pixels $covered
     try {
@@ -192,8 +231,8 @@ try {
 
     # A window over all of it.
     Start-Cover 40 40 800 620
-    $hidden = Call-Tool "get_app_state" @{}
-    Assert (-not $hidden.isError -and $null -eq (Image $hidden)) ("A fully covered fixture returned a screenshot:`n" + (Text $hidden))
+    $hidden = Read-Until "Screenshot omitted: other windows cover the whole window"
+    Assert (-not $hidden.isError -and $null -eq (Image $hidden)) ("A fully covered fixture returned a screenshot ($(Describe-Windows)):`n" + (Text $hidden))
     Assert ((Text $hidden) -match "Screenshot omitted: other windows cover the whole window") (Text $hidden)
     Write-Output "A fully covered window has no screenshot, and says why."
     $cover.Kill(); $cover.WaitForExit(); $cover = $null
