@@ -65,7 +65,7 @@ func demoSnapshot(t *testing.T) *appSnapshot {
 		WindowHandle:        1234,
 		WindowBounds:        &frame{X: 100, Y: 100, Width: 400, Height: 300},
 		ScreenshotPNGBase64: pngBase64(t, 400, 300),
-		TreeLines:           []string{"\t0 window Pi OCU Demo", "\t\t1 check box Shout Secondary Actions: Toggle"},
+		TreeLines:           []string{"\t0 window Pi OCU Demo", "\t\t1 check box Shout Secondary Actions: Toggle States: checked"},
 		Elements:            []elementRecord{{Index: 0, ControlType: "ControlType.Window"}, {Index: 1, ControlType: "ControlType.CheckBox", Name: "Shout", RuntimeID: []int{7, 42, 3}}},
 		Cover:               "clear",
 	}

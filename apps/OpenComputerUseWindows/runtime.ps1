@@ -292,6 +292,42 @@ function Assert-NotPasswordInput($element) {
     }
 }
 
+# pi-phone fork: the states an element line may carry, in this order ("States: checked, focused").
+$StateOrder = @("checked", "selected", "expanded", "collapsed", "focused", "disabled", "readonly", "secure")
+
+function ConvertTo-StateNames($Toggle, $Selected, $Expansion, [bool]$Focused, [bool]$Enabled, [bool]$Password, $ReadOnly) {
+    $found = @{}
+    if ([string]$Toggle -eq "On") { $found["checked"] = $true }
+    if ($Selected -eq $true) { $found["selected"] = $true }
+    if ([string]$Expansion -in @("Expanded", "PartiallyExpanded")) { $found["expanded"] = $true }
+    elseif ([string]$Expansion -eq "Collapsed") { $found["collapsed"] = $true }
+    if ($Focused) { $found["focused"] = $true }
+    if (-not $Enabled) { $found["disabled"] = $true }
+    if ($ReadOnly -eq $true) { $found["readonly"] = $true }
+    if ($Password) { $found["secure"] = $true }
+    return @($StateOrder | Where-Object { $found.ContainsKey($_) })
+}
+
+# UI Automation: TogglePattern, SelectionItemPattern, ExpandCollapsePattern, IsEnabled,
+# HasKeyboardFocus, IsPassword and ValuePattern.IsReadOnly.
+function Get-ElementStates($element, [bool]$isPassword) {
+    $toggle = $null; $selected = $null; $expansion = $null; $readOnly = $null
+    $focused = $false; $enabled = $true
+    try { $focused = [bool]$element.Current.HasKeyboardFocus } catch {}
+    try { $enabled = [bool]$element.Current.IsEnabled } catch {}
+    foreach ($pattern in @(try { $element.GetSupportedPatterns() } catch { @() })) {
+        try {
+            switch -Wildcard ($pattern.ProgrammaticName) {
+                "TogglePatternIdentifiers.Pattern" { $toggle = $element.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState }
+                "SelectionItemPatternIdentifiers.Pattern" { $selected = $element.GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern).Current.IsSelected }
+                "ExpandCollapsePatternIdentifiers.Pattern" { $expansion = $element.GetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern).Current.ExpandCollapseState }
+                "ValuePatternIdentifiers.Pattern" { $readOnly = $element.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.IsReadOnly }
+            }
+        } catch {}
+    }
+    return ConvertTo-StateNames $toggle $selected $expansion $focused $enabled $isPassword $readOnly
+}
+
 # A name as the snapshot recorded it (perhaps cut to text_limit, ending in ...) against the live one.
 function Test-NamesMatch([string]$Recorded, [string]$Live) {
     if ($Recorded -ceq $Live) { return $true }
@@ -1085,10 +1121,11 @@ function Get-ElementRecord($element, [int]$index, $windowBounds, $TextLimit = $s
         frame = $frame
         actions = @(Get-PatternNames $element)
         isPassword = $isPassword
+        states = @(Get-ElementStates $element $isPassword)
     }
 }
 
-# One outline line: "<index> <role> <name>[ [password]][ Value: …][ Secondary Actions: …][ Frame: {…}]".
+# One outline line: "<index> <role> <name>[ [password]][ Value: …][ Secondary Actions: …][ States: …][ Frame: {…}]".
 function Format-ElementLine($record, [int]$depth) {
     $role = $record.localizedControlType
     if ([string]::IsNullOrWhiteSpace($role)) {
@@ -1101,6 +1138,10 @@ function Format-ElementLine($record, [int]$depth) {
     $actionsSegment = ""
     if (@($record.actions).Count -gt 0) {
         $actionsSegment = " Secondary Actions: " + (@($record.actions) -join ", ")
+    }
+    # pi-phone fork: the element's states.
+    if (@($record.states).Count -gt 0) {
+        $actionsSegment += " States: " + (@($record.states) -join ", ")
     }
     $valueSegment = ""
     if (-not [string]::IsNullOrWhiteSpace($record.value) -and $record.value -ne $title) {

@@ -278,8 +278,10 @@ class HiddenDetailsTests(unittest.TestCase):
                     record = self.runtime.record_for(node, 0, [0], None, lightweight_hidden=enabled)
                 self.assertNotIn("detailsOmitted", record)
                 self.assertEqual((record["value"], record["actions"]), ("value", ["open"]))
+                # pi-phone fork: one StateSet read for the element's states (and SHOWING when enabled).
+                node.get_state_set.assert_called_once()
                 if not enabled:
-                    node.get_state_set.assert_not_called()
+                    node.get_state_set.return_value.contains.assert_not_called()
 
     def test_hidden_parent_does_not_prune_visible_menu_children_or_renumber(self):
         parent = self.node(False)
@@ -695,6 +697,51 @@ class CoveredWindowTests(unittest.TestCase):
         self.assertEqual(refused.exception.code, "covered")
 
 
+class FakeState:
+    def __init__(self, nick):
+        self.value_nick = nick
+
+
+class ElementStateTests(unittest.TestCase):
+    """pi-phone fork: element states from the AT-SPI StateSet."""
+
+    def setUp(self):
+        self.runtime = load_runtime()
+
+    def states(self, role, *nicks):
+        state_set = mock.Mock()
+        state_set.get_states.return_value = [FakeState(nick) for nick in nicks]
+        return self.runtime.element_states(state_set, role)
+
+    def test_states_map_to_the_outline_names_in_order(self):
+        self.assertEqual(self.states("check box", "enabled", "sensitive", "focusable", "checked", "focused"), ["checked", "focused"])
+        self.assertEqual(self.states("check box", "enabled", "sensitive"), [])
+        self.assertEqual(self.states("tree item", "enabled", "expandable", "selected"), ["selected", "collapsed"])
+        self.assertEqual(self.states("tree item", "enabled", "expandable", "expanded"), ["expanded"])
+        self.assertEqual(self.states("push button", "focusable", "visible"), ["disabled"])
+        self.assertEqual(self.states("text", "enabled", "sensitive"), ["readonly"])
+        self.assertEqual(self.states("text", "enabled", "editable"), [])
+        self.assertEqual(self.states("label", "enabled", "read-only"), ["readonly"])
+        self.assertEqual(self.states("password text", "enabled", "editable"), ["secure"])
+        self.assertEqual(self.states("push button"), [])
+        self.assertEqual(self.runtime.element_states(None, "check box"), [])
+
+    def test_outline_line_carries_states_and_record_carries_object_path(self):
+        node = mock.Mock()
+        node.get_name.return_value = "Shout"
+        node.get_role_name.return_value = "check box"
+        node.get_child_count.return_value = 0
+        node.path = "/org/a11y/atspi/accessible/3"
+        node.get_state_set.return_value.get_states.return_value = [FakeState(n) for n in ("enabled", "checked")]
+        with mock.patch.object(self.runtime, "relative_frame", return_value=rect(12, 96, 396, 22)), \
+             mock.patch.object(self.runtime, "accessible_id", return_value=""), \
+             mock.patch.object(self.runtime, "element_value", return_value=""), \
+             mock.patch.object(self.runtime, "action_names", return_value=["click"]):
+            records, lines = self.runtime.render_tree(node, None, [0])
+        self.assertEqual(lines[0], "\t0 check box Shout Secondary Actions: click States: checked Frame: {x: 12, y: 96, width: 396, height: 22}")
+        self.assertEqual((records[0]["states"], records[0]["objectPath"]), (["checked"], "/org/a11y/atspi/accessible/3"))
+
+
 class StaleRefTests(unittest.TestCase):
     """pi-phone fork: never act on a re-numbered element or in a replaced window."""
 
@@ -773,15 +820,6 @@ class StaleRefTests(unittest.TestCase):
                 self.runtime.perform_operation({"tool": "get_app_state", "app": "demo", "window_id": "42:6"})
             self.assertEqual(missing.exception.code, "not_found")
         pressed.assert_not_called()
-
-    def test_records_carry_the_object_path_and_the_line_is_unchanged(self):
-        node = self.node("check box", "Shout", "/org/a11y/atspi/accessible/3")
-        with mock.patch.object(self.runtime, "relative_frame", return_value=rect(12, 96, 396, 22)), \
-             mock.patch.object(self.runtime, "accessible_id", return_value=""), \
-             mock.patch.object(self.runtime, "element_value", return_value=""):
-            records, lines = self.runtime.render_tree(node, None, [0])
-        self.assertEqual(lines[0], "\t0 check box Shout Secondary Actions: click Frame: {x: 12, y: 96, width: 396, height: 22}")
-        self.assertEqual(records[0]["objectPath"], "/org/a11y/atspi/accessible/3")
 
     def test_window_ids_name_the_process_and_object(self):
         app = self.node("application", "demo", "/org/a11y/atspi/accessible/root")

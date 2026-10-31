@@ -39,6 +39,10 @@ PASSWORD_REFUSAL = (
     "into password fields; set OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT=1 to allow it."
 )
 
+# pi-phone fork: the states an element line may carry ("States: checked, focused"), in this order.
+STATE_ORDER = ("checked", "selected", "expanded", "collapsed", "focused", "disabled", "readonly", "secure")
+# Roles that hold text a person can edit: without EDITABLE they are read-only.
+EDITABLE_ROLES = {"text", "entry", "password text", "spin button", "editbar"}
 ATSPI_PATH_PREFIX = "/org/a11y/atspi/accessible/"
 
 
@@ -394,15 +398,55 @@ def parse_text_limit(value, fallback=DEFAULT_TEXT_LIMIT):
     return positive_int(value, fallback)
 
 
+def element_states(state_set, role):
+    """pi-phone fork: the element's states from its AT-SPI StateSet, as STATE_ORDER names."""
+    if state_set is None:
+        return []
+    nicks = set()
+    try:
+        for state in state_set.get_states() or []:
+            nick = safe(lambda s=state: s.value_nick, "")
+            if isinstance(nick, str) and nick:
+                nicks.add(nick)
+    except Exception:
+        return []
+    if not nicks:
+        # An empty set says nothing (a defunct object): no "disabled" for it.
+        return []
+    found = set()
+    if "checked" in nicks:
+        found.add("checked")
+    if "selected" in nicks:
+        found.add("selected")
+    if "expanded" in nicks:
+        found.add("expanded")
+    elif "expandable" in nicks:
+        found.add("collapsed")
+    if "focused" in nicks:
+        found.add("focused")
+    if "enabled" not in nicks and "sensitive" not in nicks:
+        found.add("disabled")
+    if "read-only" in nicks or (role in EDITABLE_ROLES and "editable" not in nicks):
+        found.add("readonly")
+    if role == PASSWORD_ROLE:
+        found.add("secure")
+    return [name for name in STATE_ORDER if name in found]
+
+
 def record_for(node, index, path, window_bounds, text_limit=DEFAULT_TEXT_LIMIT, lightweight_hidden=False):
     # Only an explicit non-SHOWING state qualifies. Errors/unknown state keep
     # full details; geometry alone cannot prove that a menu/control is hidden.
-    showing = safe(lambda: node.get_state_set().contains(Atspi.StateType.SHOWING)) if lightweight_hidden else None
+    # pi-phone fork: one StateSet read serves both the SHOWING check and the element's states.
+    state_set = safe(node.get_state_set)
+    showing = None
+    if lightweight_hidden and state_set is not None:
+        showing = safe(lambda: state_set.contains(Atspi.StateType.SHOWING))
     omit_details = showing is not None and not bool(showing)
     bounds = None if omit_details else relative_frame(node, window_bounds)
     role = node_role(node)
     password = role == PASSWORD_ROLE
     value = "" if omit_details or password else element_value(node, text_limit=text_limit)
+    states = [] if omit_details else element_states(state_set, role)
     return {
         "index": index,
         "runtimeId": path[:],
@@ -416,6 +460,7 @@ def record_for(node, index, path, window_bounds, text_limit=DEFAULT_TEXT_LIMIT, 
         "frame": bounds,
         "actions": [] if omit_details else action_names(node),
         **({"objectPath": object_path(node)} if object_path(node) else {}),
+        **({"states": states} if states else {}),
         **({"detailsOmitted": True} if omit_details else {}),
         **({"isPassword": True} if password else {}),
     }
@@ -446,6 +491,8 @@ def render_tree(root, window_bounds, root_path, text_limit=DEFAULT_TEXT_LIMIT, m
         actions_segment = ""
         if record["actions"]:
             actions_segment = " Secondary Actions: " + ", ".join(record["actions"])
+        if record.get("states"):
+            actions_segment += " States: " + ", ".join(record["states"])
         frame_segment = ""
         if record["frame"] is not None:
             f = record["frame"]

@@ -1,18 +1,19 @@
 param([Parameter(Mandatory = $true)][string]$RuntimePath)
 $ErrorActionPreference = "Stop"
-# pi-phone fork (PP-270): run runtime.ps1's own functions for coded errors, stale refs and covered
-# regions against instrumented doubles. Runs under pwsh on Linux too; the
+# pi-phone fork (PP-270): run runtime.ps1's own functions for coded errors, element states, stale refs
+# and covered regions against instrumented doubles. Runs under pwsh on Linux too; the
 # real UI Automation and z-order paths are covered by windows-pi-phone-smoke.ps1 on a Windows desktop.
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($RuntimePath, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
-$names = @("New-OCUError", "New-Frame", "Limit-Text", "Test-NamesMatch", "ConvertTo-ComparableActions",
+$names = @("New-OCUError", "New-Frame", "Limit-Text", "ConvertTo-StateNames", "Test-NamesMatch", "ConvertTo-ComparableActions",
     "Test-RecordMatches", "New-StaleElementError", "Get-UnionArea", "Get-Overlap", "Get-CoveredRegions", "Get-BlackoutRects",
     "Get-ElementTitle", "Format-ElementLine", "Find-Element", "Same-RuntimeId", "Resolve-TargetWindow",
     "Test-EnvFlagEnabled", "Assert-NotPasswordInput", "Test-ElementIsPassword")
 $functions = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names }, $true)
 if ($functions.Count -ne $names.Count) { throw "Production functions missing: $($names | Where-Object { $_ -notin $functions.Name })" }
 foreach ($function in $functions) { Invoke-Expression $function.Extent.Text }
+$StateOrder = @("checked", "selected", "expanded", "collapsed", "focused", "disabled", "readonly", "secure")
 $PasswordMarker = "[password]"
 $DefaultTextLimit = 500
 
@@ -29,12 +30,21 @@ $script:AllowPasswordInputThisCall = $false
 $secret = [pscustomobject]@{ Current = [pscustomobject]@{ IsPassword = $true } }
 Assert ((Code { Assert-NotPasswordInput $secret }) -eq "password_field") "Password refusal is not coded"
 
-# The outline line keeps its form.
+# Element states from UI Automation patterns, in the outline's order.
+function States { (@(ConvertTo-StateNames @args) -join ",") }
+Assert ((States "On" $null $null $true $true $false $null) -eq "checked,focused") "Checked state"
+Assert ((States "Off" $null $null $false $true $false $null) -eq "") "Unchecked state"
+Assert ((States "Indeterminate" $true "Collapsed" $false $true $false $null) -eq "selected,collapsed") "Selected and collapsed"
+Assert ((States $null $false "Expanded" $false $false $false $true) -eq "expanded,disabled,readonly") "Expanded, disabled, read-only"
+Assert ((States $null $null "LeafNode" $true $true $true $false) -eq "focused,secure") "Password field"
 $record = [pscustomobject]@{ index = 4; localizedControlType = "check box"; controlType = "ControlType.CheckBox"; name = "Shout"; automationId = "";
-    value = ""; isPassword = $false; actions = @("Toggle"); frame = [pscustomobject]@{ x = 20; y = 30; width = 80; height = 20 } }
-Assert ((Format-ElementLine $record 0) -eq "`t4 check box Shout Secondary Actions: Toggle Frame: {x: 20, y: 30, width: 80, height: 20}") "Line changed"
-$password = [pscustomobject]@{ index = 2; localizedControlType = "edit"; name = "Password"; automationId = ""; value = ""; isPassword = $true; actions = @("SetValue"); frame = $null }
-Assert ((Format-ElementLine $password 0) -eq "`t2 edit Password [password] Secondary Actions: SetValue") "Password line"
+    value = ""; isPassword = $false; actions = @("Toggle"); states = @("checked"); frame = [pscustomobject]@{ x = 20; y = 30; width = 80; height = 20 } }
+$line = Format-ElementLine $record 1
+Assert ($line -eq "`t`t4 check box Shout Secondary Actions: Toggle States: checked Frame: {x: 20, y: 30, width: 80, height: 20}") "Line with states: $line"
+$record.states = @()
+Assert ((Format-ElementLine $record 0) -eq "`t4 check box Shout Secondary Actions: Toggle Frame: {x: 20, y: 30, width: 80, height: 20}") "Line without states kept its old form"
+$password = [pscustomobject]@{ index = 2; localizedControlType = "edit"; name = "Password"; automationId = ""; value = ""; isPassword = $true; actions = @("SetValue"); states = @("secure"); frame = $null }
+Assert ((Format-ElementLine $password 0) -eq "`t2 edit Password [password] Secondary Actions: SetValue States: secure") "Password line"
 
 # Stale refs: the element with the recorded RuntimeId must still be what the snapshot saw.
 function New-Fake([int[]]$runtimeId, [string]$name, [string]$type = "ControlType.Button", [string[]]$actions = @("Invoke")) {
@@ -99,4 +109,4 @@ $strips = @(Get-BlackoutRects $bounds @((New-Frame 300 0 100 150)) $painted)
 Assert ($strips.Count -eq 4 -and $strips[0].x -eq 300) "Blackout keeps the covered part first: $($strips | ConvertTo-Json -Depth 3)"
 Assert (($strips | Where-Object { $_.x -eq 0 -and $_.width -eq 7 }) -and ($strips | Where-Object { $_.x -eq 393 -and $_.width -eq 7 }) -and ($strips | Where-Object { $_.y -eq 293 -and $_.height -eq 7 })) "Invisible borders not blacked out"
 
-Write-Output "pi-phone runtime functions: coded errors, stale refs, window replacement and covered regions passed (instrumented doubles)."
+Write-Output "pi-phone runtime functions: coded errors, states, stale refs, window replacement and covered regions passed (instrumented doubles)."

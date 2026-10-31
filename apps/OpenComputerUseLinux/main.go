@@ -89,10 +89,11 @@ type elementRecord struct {
 	Actions              []string `json:"actions,omitempty"`
 	// pi-phone fork: a password field (AT-SPI ROLE_PASSWORD_TEXT); its value is never read.
 	IsPassword bool `json:"isPassword,omitempty"`
-	// pi-phone fork: the AT-SPI object path (the element's identity for stale_ref), and whether the
-	// lightweight-hidden mode left out its details.
-	ObjectPath     string `json:"objectPath,omitempty"`
-	DetailsOmitted bool   `json:"detailsOmitted,omitempty"`
+	// pi-phone fork: the AT-SPI object path (the element's identity for stale_ref), its states, and
+	// whether the lightweight-hidden mode left out its details.
+	ObjectPath     string   `json:"objectPath,omitempty"`
+	States         []string `json:"states,omitempty"`
+	DetailsOmitted bool     `json:"detailsOmitted,omitempty"`
 }
 
 type appSnapshot struct {

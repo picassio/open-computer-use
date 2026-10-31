@@ -64,7 +64,7 @@ func demoSnapshot() *appSnapshot {
 		WindowTitle:  "Pi OCU Demo",
 		WindowID:     "42:6",
 		WindowBounds: &frame{X: 100, Y: 100, Width: 400, Height: 300},
-		TreeLines:    []string{"\t0 frame Pi OCU Demo", "\t\t1 check box Shout Secondary Actions: click"},
+		TreeLines:    []string{"\t0 frame Pi OCU Demo", "\t\t1 check box Shout Secondary Actions: click States: checked"},
 		Elements:     []elementRecord{{Index: 0, ControlType: "frame"}, {Index: 1, ControlType: "check box", Name: "Shout", ObjectPath: "/org/a11y/atspi/accessible/3"}},
 		Cover:        "clear",
 	}

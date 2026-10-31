@@ -1,6 +1,6 @@
 param([Parameter(Mandatory = $true)][string]$NativePath)
 # pi-phone fork (PP-270): real WPF + native MCP checks on a Windows desktop.
-# - Each read has "Snapshot:" and "Window id:".
+# - Each read has "Snapshot:" and "Window id:"; a check box shows "States: checked" once ticked.
 # - An element rebuilt after the read is refused with stale_ref (never acts on another one); an old
 #   snapshot id and a replaced window are refused with stale_ref.
 # - A second, topmost window over part of the fixture: its part is reported ("Covered: [...]") and black
@@ -112,6 +112,14 @@ try {
     Assert ((Text $state) -notmatch "(?m)^Covered:") ("The uncovered fixture was reported covered:`n" + (Text $state))
     Assert ($null -ne (Image $state)) "No screenshot of the uncovered fixture"
     Write-Output "Reads carry Snapshot: and Window id:; the uncovered fixture has no Covered: line."
+
+    # Check box state.
+    Assert ((Line-Of $state "check box Shout") -notmatch "States:.*checked") "Unticked check box shows checked"
+    $ticked = Call-Tool "click" @{ element_index = (Index-Of $state "check box Shout"); snapshot_id = (Snapshot-Of $state) }
+    Assert (-not $ticked.isError) (Text $ticked)
+    Wait-For { (Read-State).checked } "check box ticked"
+    Assert ((Line-Of $ticked "check box Shout") -match "States: (\w+, )*checked") ("Ticked check box line: " + (Line-Of $ticked "check box Shout"))
+    Write-Output "Check box: $((Line-Of $ticked 'check box Shout').Trim())"
 
     # A rebuilt element is stale; it is never another element.
     $state = Call-Tool "get_app_state" @{ include_screenshot = $false }

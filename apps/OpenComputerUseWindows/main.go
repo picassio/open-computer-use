@@ -96,6 +96,8 @@ type elementRecord struct {
 	Actions              []string `json:"actions,omitempty"`
 	// pi-phone fork: a password field (UI Automation IsPassword); its value is never read.
 	IsPassword bool `json:"isPassword,omitempty"`
+	// pi-phone fork: its states (TogglePattern, SelectionItem, ExpandCollapse, IsEnabled, ...).
+	States []string `json:"states,omitempty"`
 }
 
 type appSnapshot struct {
