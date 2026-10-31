@@ -38,6 +38,8 @@ PASSWORD_REFUSAL = (
     "into password fields; set OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT=1 to allow it."
 )
 
+ATSPI_PATH_PREFIX = "/org/a11y/atspi/accessible/"
+
 
 class OCUError(RuntimeError):
     """pi-phone fork: a refusal or failure with a machine-readable code.
@@ -257,6 +259,76 @@ def resolve_app(query):
     raise OCUError("not_found", 'appNotFound("{}")'.format(query))
 
 
+def object_path(node):
+    """pi-phone fork: the AT-SPI object path, stable while the object lives; a new object gets a new one."""
+    value = safe(lambda: node.path, "")
+    return value if isinstance(value, str) else ""
+
+
+def window_id_of(app, window):
+    """pi-phone fork: '<pid>:<object id>', unique on the desktop while the window lives; '' when unknown."""
+    path = object_path(window)
+    if not path:
+        return ""
+    if path.startswith(ATSPI_PATH_PREFIX):
+        path = path[len(ATSPI_PATH_PREFIX):]
+    return "{}:{}".format(node_pid(app), path)
+
+
+def matching_apps(query):
+    """pi-phone fork: every app the query matches, in desktop order (resolve_app takes the first)."""
+    return [app for app in iter_apps() if matches_query(app, query)]
+
+
+def find_window(query, window_id, apps=None):
+    """The (app, index, window) with this window id, of an app the query matches; None when it is gone."""
+    pid_text = str(window_id).partition(":")[0]
+    for app in (iter_apps() if apps is None else apps):
+        if str(node_pid(app)) != pid_text or (apps is None and not matches_query(app, query)):
+            continue
+        for index, window in app_windows(app):
+            if window_id_of(app, window) == window_id:
+                return app, index, window
+    return None
+
+
+def other_windows(apps, chosen_id, limit=8):
+    """pi-phone fork: the other windows of the apps the query matches, to pick one by window_id."""
+    others = []
+    for app in apps:
+        for _, window in app_windows(app):
+            window_id = window_id_of(app, window)
+            if window_id and window_id != chosen_id and len(others) < limit:
+                others.append({"id": window_id, "title": limit_text(node_name(window), 80), "app": node_name(app)})
+    return others
+
+
+def resolve_target(query, window_id=None, stale=False, apps=None):
+    """pi-phone fork: the app and window to read or act in (apps: matching_apps(query), if read already).
+
+    With a window id, that window or nothing: not_found for a read (the caller named it), stale_ref for an
+    action (the snapshot's window was closed or replaced). Without one, the app's main window, as upstream.
+    """
+    if window_id:
+        found = find_window(query, window_id, apps)
+        if found is None:
+            if stale:
+                raise OCUError(
+                    "stale_ref",
+                    "The window {} that the snapshot read is gone or was replaced.".format(window_id),
+                )
+            raise OCUError("not_found", "No window {} of an app matching {!r}.".format(window_id, query))
+        return found
+    if apps is None:
+        app = resolve_app(query)
+    elif apps:
+        app = apps[0]
+    else:
+        raise OCUError("not_found", 'appNotFound("{}")'.format(query))
+    index, window = main_window(app)
+    return app, index, window
+
+
 def action_names(node):
     names = []
     count = int(safe(node.get_n_actions, 0) or 0)
@@ -342,6 +414,7 @@ def record_for(node, index, path, window_bounds, text_limit=DEFAULT_TEXT_LIMIT, 
         "nativeWindowHandle": 0,
         "frame": bounds,
         "actions": [] if omit_details else action_names(node),
+        **({"objectPath": object_path(node)} if object_path(node) else {}),
         **({"detailsOmitted": True} if omit_details else {}),
         **({"isPassword": True} if password else {}),
     }
@@ -504,10 +577,12 @@ def focus_details(window, text_limit=DEFAULT_TEXT_LIMIT, max_nodes=MAX_ELEMENTS,
     return summary, selection, False
 
 
-def build_snapshot(query, text_limit=DEFAULT_TEXT_LIMIT, max_tree_nodes=MAX_ELEMENTS, max_tree_depth=MAX_DEPTH, include_ax=True, include_screenshot=True):
-    app = resolve_app(query)
-    window_index, window = main_window(app)
+def build_snapshot(query, text_limit=DEFAULT_TEXT_LIMIT, max_tree_nodes=MAX_ELEMENTS, max_tree_depth=MAX_DEPTH, include_ax=True, include_screenshot=True, window_id=None):
+    # One pass over the desktop's apps finds the target and the other windows the query matches.
+    apps = matching_apps(query)
+    app, window_index, window = resolve_target(query, window_id, apps=apps)
     bounds = extents(window)
+    chosen_id = window_id_of(app, window)
     records, lines = [], []
     focus, selection = None, None
     if include_ax:
@@ -531,6 +606,8 @@ def build_snapshot(query, text_limit=DEFAULT_TEXT_LIMIT, max_tree_nodes=MAX_ELEM
         },
         "windowTitle": limit_text(node_name(window), text_limit=text_limit),
         "windowBounds": bounds,
+        "windowId": chosen_id,
+        "otherWindows": other_windows(apps, chosen_id),
         "screenshotPngBase64": capture_window_png(bounds) if include_screenshot else None,
         "treeLines": lines,
         "focusedSummary": focus,
@@ -592,36 +669,72 @@ def resolve_path(app, path):
     return node
 
 
-def same_frame(record_frame, node_frame):
-    if record_frame is None or node_frame is None:
+def names_match(recorded, live):
+    """A name as the snapshot recorded it (perhaps cut to text_limit, ending in ...) against the live one."""
+    recorded, live = str(recorded or ""), str(live or "")
+    if recorded == live:
+        return True
+    return recorded.endswith("...") and len(live) > len(recorded) - 3 and live.startswith(recorded[:-3])
+
+
+def element_matches(node, record):
+    """pi-phone fork: whether a live element is the one the snapshot saw: role, name, actions, object path."""
+    if node is None:
         return False
-    for key in ("x", "y", "width", "height"):
-        if abs(float(record_frame.get(key, 0)) - float(node_frame.get(key, 0))) > 3:
-            return False
+    if node_role(node) != str(record.get("controlType") or ""):
+        return False
+    if not names_match(record.get("name"), node_name(node)):
+        return False
+    recorded_path = str(record.get("objectPath") or "")
+    if recorded_path and object_path(node) and object_path(node) != recorded_path:
+        return False
+    if not record.get("detailsOmitted") and list(record.get("actions") or []) != action_names(node):
+        return False
     return True
 
 
-def find_element(app, record):
+def stale_element(record, why):
+    return OCUError(
+        "stale_ref",
+        "[{}] is no longer the {} {!r} that the snapshot saw ({}).".format(
+            record.get("index"), record.get("controlType") or "element", record.get("name") or "", why
+        ),
+    )
+
+
+def find_element(app, record, window=None):
+    """pi-phone fork: the live element the snapshot's record names, or a stale_ref refusal.
+
+    Never acts on a re-numbered element: the element at the recorded path must still be the one the snapshot
+    saw (role, name, actions, AT-SPI object path); else the object with the recorded path, if it is still
+    the same element; else stale_ref. Without an object path only one unambiguous match counts.
+    """
     if not record:
         return None
     node = resolve_path(app, record.get("runtimeId") or [])
-    if node is not None:
+    if element_matches(node, record):
         return node
-
-    _, window = main_window(app)
-    target_name = str(record.get("name") or "")
-    target_id = str(record.get("automationId") or "")
-    target_role = str(record.get("controlType") or "")
-    window_bounds = extents(window)
-    for candidate in iter_all(window):
-        if target_id and accessible_id(candidate) == target_id:
-            return candidate
-        if target_name and node_name(candidate) == target_name and node_role(candidate) == target_role:
-            return candidate
-        if target_role and node_role(candidate) == target_role:
-            if same_frame(record.get("frame"), relative_frame(candidate, window_bounds)):
-                return candidate
-    return None
+    if window is None:
+        _, window = main_window(app)
+    recorded_path = str(record.get("objectPath") or "")
+    if recorded_path:
+        moved = find_first(window, lambda candidate: object_path(candidate) == recorded_path)
+        if element_matches(moved, record):
+            return moved
+        raise stale_element(record, "it changed or went away" if moved is None else "it changed")
+    if node is not None:
+        raise stale_element(record, "another element is there now")
+    candidates = [candidate for candidate in iter_all(window) if element_matches(candidate, record)]
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        raise OCUError(
+            "ambiguous_target",
+            "[{}] matches {} elements now ({} {!r}).".format(
+                record.get("index"), len(candidates), record.get("controlType") or "element", record.get("name") or ""
+            ),
+        )
+    raise stale_element(record, "it went away")
 
 
 def preferred_action_index(node):
@@ -900,14 +1013,16 @@ def perform_operation(operation):
                 max_tree_depth=positive_int(operation.get("max_tree_depth"), MAX_DEPTH),
                 include_ax=operation.get("include_ax", True),
                 include_screenshot=operation.get("include_screenshot", True),
+                window_id=operation.get("window_id") or None,
             ),
         }
 
-    app = resolve_app(operation.get("app", ""))
-    _, window = main_window(app)
+    # pi-phone fork: act in the window the snapshot read (stale_ref when it is gone or replaced), on the
+    # element it saw (stale_ref when it changed).
+    app, _, window = resolve_target(operation.get("app", ""), operation.get("window_id") or None, stale=True)
     bounds = operation.get("windowBounds") or extents(window)
     element_record = operation.get("element")
-    element = find_element(app, element_record)
+    element = find_element(app, element_record, window)
     # pi-phone fork: only this call's own opt-out counts (exactly true), never a default.
     allow_password = operation.get("allow_password_input") is True
 
@@ -988,7 +1103,12 @@ def perform_operation(operation):
         return {"ok": True}
 
     time.sleep(0.12)
+    # The read after an action follows the app's main window, as upstream, unless the call named a window.
+    pinned = operation.get("window_id") if operation.get("explicit_window") is True else None
+    if pinned:
+        return {"ok": True, "snapshot": build_snapshot(operation.get("app", ""), window_id=pinned)}
     return {"ok": True, "snapshot": build_snapshot(operation.get("app", ""))}
+
 
 
 def main():

@@ -22,9 +22,14 @@ The fork's work is on the `pi-phone` branch. `main` follows upstream.
 
 PP-270 phase 1 (ideas from [vercel-labs/agent-desktop](https://github.com/vercel-labs/agent-desktop), Apache-2.0, reimplemented here; no code copied):
 
+- **Snapshot-scoped refs** (Linux and Windows):
+  - Every read has `Snapshot: <8 hex>` and `Window id: <id>` lines after `Window:` (Windows: the window handle; Linux: `<pid>:<AT-SPI object id>`), and `Other windows: <id> "title" (app), …` when the app query matches more windows. `get_app_state` takes `window_id` to read one of them.
+  - Every action takes optional `snapshot_id` and `window_id`. A `snapshot_id` that is not the app's latest read, or a `window_id` that is not its window, is refused with `stale_ref` (naming the snapshot that replaced it). Only ids and app names of old snapshots are kept, in memory; nothing is written to disk.
+  - Each action carries the snapshot's window: when it was closed or replaced, `stale_ref`. The element is re-identified before acting, with or without `snapshot_id`: same role, name (a name cut by `text_limit` still matches) and actions, and the same AT-SPI object path / UIA RuntimeId (Windows treats Expand/Collapse as one action). An element that moved keeps its identity and is found again; another element at its number, or a rebuilt one, is `stale_ref`; without a runtime id, twins are `ambiguous_target`. ocu never acts on a re-numbered element.
+  - The read after an action still follows the app's main window (as upstream) unless the call named a `window_id`.
 - **Structured errors:** every refusal and failure ends with `Error: <code> retry=<safe|unsafe> suggestion=<text>` after the human message, and `structuredContent.error` holds the same. Codes: `stale_ref`, `ambiguous_target`, `policy_denied`, `covered`, `not_found`, `password_field`, plus `invalid_argument` (bad arguments), `action_failed` (an action failed in the runtime; it may have happened, so `retry=unsafe`) and `failed` (a read failed). Every other code is raised before anything reaches the app, so `retry=safe`.
 - **Releases:**
-  - `.github/workflows/pi-phone.yml` tests both runtimes, including a real WPF password-box smoke on Windows. `windows-pi-phone.test.ps1` runs runtime.ps1's own functions against doubles under Windows PowerShell and, on Linux, pwsh.
+  - `.github/workflows/pi-phone.yml` tests both runtimes, including real WPF smokes on Windows: the password box, and `windows-pi-phone-smoke.ps1` (snapshot refs). `windows-pi-phone.test.ps1` runs runtime.ps1's own functions against doubles under Windows PowerShell and, on Linux, pwsh.
   - On a `v*-pp.*` tag, it publishes `open-computer-use-linux-x64`, `open-computer-use-linux-arm64` and `open-computer-use-windows-x64.exe` with `SHA256SUMS`.
   - Upstream's macOS/npm `release.yml` runs only by hand in this fork.
 

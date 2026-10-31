@@ -11,6 +11,7 @@
 
 ## pi-phone fork（PP-270）
 
+- 每次观察生成随机的 `Snapshot:` id；动作可带 `snapshot_id` / `window_id`，不是最新观察或窗口已被替换时以 `stale_ref` 拒绝；动作前按角色、名称、动作和 AT-SPI 对象路径 / UIA RuntimeId 重新确认元素，绝不对重新编号后的其他元素执行动作。旧 snapshot 只在内存中保留 id，不写入磁盘。
 - 拒绝与失败都附带机器可读的一行 `Error: <code> retry=<safe|unsafe> suggestion=<text>`。详见 [PI-PHONE.md](../PI-PHONE.md)。
 
 ## 数据处理

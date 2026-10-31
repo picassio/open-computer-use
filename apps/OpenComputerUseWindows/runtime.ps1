@@ -20,7 +20,9 @@ Add-Type -AssemblyName System.Drawing
 
 Add-Type -TypeDefinition @"
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class OCUWin32 {
     [StructLayout(LayoutKind.Sequential)]
@@ -130,6 +132,53 @@ public static class OCUWin32 {
 
     [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    // pi-phone fork (PP-270): window identity and the windows of a process.
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("user32.dll")]
+    private static extern int GetWindowLong(IntPtr hWnd, int index);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+
+    public static string WindowTitle(IntPtr hWnd) {
+        StringBuilder text = new StringBuilder(512);
+        GetWindowText(hWnd, text, text.Capacity);
+        return text.ToString();
+    }
+
+    public static int WindowProcessId(IntPtr hWnd) {
+        uint processId;
+        GetWindowThreadProcessId(hWnd, out processId);
+        return (int)processId;
+    }
+
+    // Whether a top-level window paints on the screen: visible, not minimised, not cloaked (another
+    // virtual desktop, a suspended app), not a tool window, not a click-through layered overlay.
+    public static bool Paints(IntPtr hWnd) {
+        if (!IsWindowVisible(hWnd) || IsIconic(hWnd)) return false;
+        int extended = GetWindowLong(hWnd, -20);
+        if ((extended & 0x80) != 0) return false;
+        if ((extended & 0x80000) != 0 && (extended & 0x20) != 0) return false;
+        int cloaked;
+        if (DwmGetWindowAttribute(hWnd, 14, out cloaked, 4) == 0 && cloaked != 0) return false;
+        return true;
+    }
+
+    // The painting, titled top-level windows of a process, from the top.
+    public static long[] WindowsOfProcess(int processId) {
+        List<long> windows = new List<long>();
+        EnumWindows(delegate (IntPtr hWnd, IntPtr unused) {
+            if (WindowProcessId(hWnd) == processId && Paints(hWnd) && WindowTitle(hWnd).Length > 0) windows.Add(hWnd.ToInt64());
+            return true;
+        }, IntPtr.Zero);
+        return windows.ToArray();
+    }
 }
 "@
 
@@ -220,6 +269,73 @@ function Assert-NotPasswordInput($element) {
         throw (New-OCUError "password_field" "Refused: the target is a password field. Open Computer Use (pi-phone build) does not type into password fields; set OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT=1 to allow it.")
     }
 }
+
+# A name as the snapshot recorded it (perhaps cut to text_limit, ending in ...) against the live one.
+function Test-NamesMatch([string]$Recorded, [string]$Live) {
+    if ($Recorded -ceq $Live) { return $true }
+    return ($Recorded.EndsWith("...") -and $Live.Length -gt ($Recorded.Length - 3) -and $Live.StartsWith($Recorded.Substring(0, $Recorded.Length - 3), [System.StringComparison]::Ordinal))
+}
+
+# Expand and Collapse follow the element's state; either way it is the same ExpandCollapse element.
+function ConvertTo-ComparableActions($actions) {
+    return (@($actions | ForEach-Object { if ($_ -in @("Expand", "Collapse")) { "ExpandCollapse" } else { [string]$_ } } | Select-Object -Unique) -join ",")
+}
+
+# pi-phone fork: whether a live element is the one the snapshot saw (role, name, actions).
+function Test-RecordMatches($Live, $Record) {
+    if ([string]$Live.controlType -ne [string]$Record.controlType) { return $false }
+    if (-not (Test-NamesMatch ([string]$Record.name) ([string]$Live.name))) { return $false }
+    return (ConvertTo-ComparableActions $Live.actions) -eq (ConvertTo-ComparableActions $Record.actions)
+}
+
+function Get-LiveIdentity($element) {
+    [pscustomobject]@{
+        controlType = Get-ElementControlTypeName $element
+        name = Get-ElementString $element "Name"
+        actions = @(Get-PatternNames $element)
+    }
+}
+
+function New-StaleElementError($record, [string]$why) {
+    $role = if ([string]::IsNullOrWhiteSpace($record.controlType)) { "element" } else { [string]$record.controlType }
+    return (New-OCUError "stale_ref" ("[{0}] is no longer the {1} '{2}' that the snapshot saw ({3})." -f $record.index, $role, $record.name, $why))
+}
+
+# pi-phone fork: the window a call reads or acts in. An action's snapshot window must still exist and
+# belong to the snapshot's process (stale_ref); a get_app_state window_id must belong to an app the
+# query matches (not_found).
+function Resolve-TargetWindow($operation, [bool]$IsAction) {
+    $handle = [long]$operation.windowHandle
+    if ($handle -le 0) { return $null }
+    $hwnd = [IntPtr]$handle
+    $owner = if ([OCUWin32]::IsWindow($hwnd)) { [OCUWin32]::WindowProcessId($hwnd) } else { 0 }
+    if ($IsAction) {
+        if ($owner -eq 0 -or ($operation.expected_pid -gt 0 -and $owner -ne $operation.expected_pid)) {
+            throw (New-OCUError "stale_ref" "The window $handle that the snapshot read is gone or was replaced.")
+        }
+    } else {
+        $matching = @(Get-MatchingProcesses $operation.app | ForEach-Object { $_.Id })
+        $title = if ($owner -ne 0) { [OCUWin32]::WindowTitle($hwnd) } else { "" }
+        if ($owner -eq 0 -or -not ($matching -contains $owner -or ($title -ne "" -and $title -ilike "*$($operation.app.Trim())*"))) {
+            throw (New-OCUError "not_found" "No window $handle of an app matching '$($operation.app)'.")
+        }
+    }
+    return [pscustomobject]@{ hwnd = $hwnd; process = (Get-Process -Id $owner) }
+}
+
+# pi-phone fork: the other windows the query matches, so a caller can read one by window_id.
+function Get-OtherWindows([string]$query, [long]$chosen, [int]$limit = 8) {
+    $others = New-Object System.Collections.Generic.List[object]
+    foreach ($process in @(Get-MatchingProcesses $query)) {
+        foreach ($handle in [OCUWin32]::WindowsOfProcess($process.Id)) {
+            if ($handle -ne $chosen -and $others.Count -lt $limit) {
+                $others.Add([pscustomobject]@{ id = [string]$handle; title = (Limit-Text ([OCUWin32]::WindowTitle([IntPtr]$handle)) 80); app = $process.ProcessName })
+            }
+        }
+    }
+    return $others.ToArray()
+}
+
 
 function Get-FocusedElementOf($process) {
     try {
@@ -669,7 +785,9 @@ function Send-Key([IntPtr]$hwnd, [string]$key, [string]$method = "auto") {
     }
 }
 
-function Resolve-App([string]$query) {
+# Every process with a main window that the query names (pid, process name or window title), in the
+# order Resolve-App picks from. pi-phone fork: also lists the other windows a query matches.
+function Get-MatchingProcesses([string]$query) {
     $normalized = $query.Trim()
     $processQuery = $normalized
     if ($processQuery.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -678,18 +796,22 @@ function Resolve-App([string]$query) {
     $processes = @(Get-Process | Where-Object { $_.MainWindowHandle -ne 0 })
     $pidValue = 0
     if ([int]::TryParse($normalized, [ref]$pidValue)) {
-        $match = $processes | Where-Object { $_.Id -eq $pidValue } | Select-Object -First 1
-        if ($null -ne $match) {
+        $match = @($processes | Where-Object { $_.Id -eq $pidValue })
+        if ($match.Count -gt 0) {
             return $match
         }
     }
-
-    $match = $processes | Where-Object {
+    return @($processes | Where-Object {
         $_.ProcessName -ieq $processQuery -or
         "$($_.ProcessName).exe" -ieq $normalized -or
         $_.MainWindowTitle -ieq $normalized -or
         $_.MainWindowTitle -ilike "*$normalized*"
-    } | Select-Object -First 1
+    })
+}
+
+function Resolve-App([string]$query) {
+    $normalized = $query.Trim()
+    $match = @(Get-MatchingProcesses $query) | Select-Object -First 1
     if ($null -ne $match) {
         return $match
     }
@@ -711,7 +833,19 @@ function Resolve-App([string]$query) {
     throw (New-OCUError "not_found" "appNotFound(`"$query`")")
 }
 
+# pi-phone fork: the window this call reads or acts in, when it is not the process's main window.
+$script:TargetWindow = [IntPtr]::Zero
+$script:TargetProcess = $null
+
+function Get-TargetHandle($process) {
+    if ($script:TargetWindow -ne [IntPtr]::Zero) { return $script:TargetWindow }
+    return [IntPtr]$process.MainWindowHandle
+}
+
 function Get-MainElement($process) {
+    if ($script:TargetWindow -ne [IntPtr]::Zero) {
+        return [Windows.Automation.AutomationElement]::FromHandle($script:TargetWindow)
+    }
     if ($process.MainWindowHandle -ne 0) {
         return [Windows.Automation.AutomationElement]::FromHandle([IntPtr]$process.MainWindowHandle)
     }
@@ -724,7 +858,7 @@ function Get-MainElement($process) {
 }
 
 function Get-WindowBounds($process, $element) {
-    $hwnd = [IntPtr]$process.MainWindowHandle
+    $hwnd = Get-TargetHandle $process
     return Get-CapturableWindowFrame $hwnd
 }
 
@@ -858,6 +992,32 @@ function Get-ElementRecord($element, [int]$index, $windowBounds, $TextLimit = $s
     }
 }
 
+# One outline line: "<index> <role> <name>[ [password]][ Value: …][ Secondary Actions: …][ Frame: {…}]".
+function Format-ElementLine($record, [int]$depth) {
+    $role = $record.localizedControlType
+    if ([string]::IsNullOrWhiteSpace($role)) {
+        $role = $record.controlType
+    }
+    $title = Get-ElementTitle $record
+    if ($record.isPassword) {
+        $title = ("$title " + $PasswordMarker).Trim()
+    }
+    $actionsSegment = ""
+    if (@($record.actions).Count -gt 0) {
+        $actionsSegment = " Secondary Actions: " + (@($record.actions) -join ", ")
+    }
+    $valueSegment = ""
+    if (-not [string]::IsNullOrWhiteSpace($record.value) -and $record.value -ne $title) {
+        $safeValue = (($record.value -replace "`r", "\\r") -replace "`n", "\\n")
+        $valueSegment = " Value: $safeValue"
+    }
+    $frameSegment = ""
+    if ($null -ne $record.frame) {
+        $frameSegment = " Frame: {{x: {0}, y: {1}, width: {2}, height: {3}}}" -f [int][math]::Round($record.frame.x), [int][math]::Round($record.frame.y), [int][math]::Round($record.frame.width), [int][math]::Round($record.frame.height)
+    }
+    return ("`t" * ($depth + 1)) + "$($record.index) $role $title$valueSegment$actionsSegment$frameSegment"
+}
+
 function Get-ElementTitle($record) {
     if (-not [string]::IsNullOrWhiteSpace($record.name)) {
         return $record.name
@@ -890,29 +1050,7 @@ function Render-Tree($element, $windowBounds, $TextLimit = $script:DefaultTextLi
         $script:nextIndex++
         $record = Get-ElementRecord $node $index $script:windowBounds $TextLimit
         $script:records.Add($record)
-
-        $role = $record.localizedControlType
-        if ([string]::IsNullOrWhiteSpace($role)) {
-            $role = $record.controlType
-        }
-        $title = Get-ElementTitle $record
-        if ($record.isPassword) {
-            $title = ("$title " + $PasswordMarker).Trim()
-        }
-        $actionsSegment = ""
-        if ($record.actions.Count -gt 0) {
-            $actionsSegment = " Secondary Actions: " + ($record.actions -join ", ")
-        }
-        $valueSegment = ""
-        if (-not [string]::IsNullOrWhiteSpace($record.value) -and $record.value -ne $title) {
-            $safeValue = (($record.value -replace "`r", "\\r") -replace "`n", "\\n")
-            $valueSegment = " Value: $safeValue"
-        }
-        $frameSegment = ""
-        if ($null -ne $record.frame) {
-            $frameSegment = " Frame: {{x: {0}, y: {1}, width: {2}, height: {3}}}" -f [int][math]::Round($record.frame.x), [int][math]::Round($record.frame.y), [int][math]::Round($record.frame.width), [int][math]::Round($record.frame.height)
-        }
-        $script:lines.Add(("`t" * ($depth + 1)) + "$index $role $title$valueSegment$actionsSegment$frameSegment")
+        $script:lines.Add((Format-ElementLine $record $depth))
 
         try {
             $children = $node.FindAll([Windows.Automation.TreeScope]::Children, [Windows.Automation.Condition]::TrueCondition)
@@ -1018,9 +1156,11 @@ function Build-Snapshot([string]$query, $TextLimit = $script:DefaultTextLimit, [
     if (-not $IncludeAX -and -not $IncludeScreenshot) {
         throw "At least one of include_ax or include_screenshot must be true"
     }
-    $process = Resolve-App $query
+    # pi-phone fork: a window named by window_id (Resolve-TargetWindow sets TargetWindow and its process).
+    if ($null -ne $script:TargetProcess) { $process = $script:TargetProcess } else { $process = Resolve-App $query }
     $element = Get-MainElement $process
     $bounds = Get-WindowBounds $process $element
+    $handle = Get-TargetHandle $process
     $rendered = @{ lines = @(); records = @() }
     $focus = $null
     $selection = $null
@@ -1031,14 +1171,17 @@ function Build-Snapshot([string]$query, $TextLimit = $script:DefaultTextLimit, [
         $selection = Get-SelectedText $process.Id $TextLimit
     }
     if ($IncludeScreenshot) { $image = Capture-WindowPngBase64 $bounds }
+    $title = $process.MainWindowTitle
+    if ($handle -ne [IntPtr]$process.MainWindowHandle) { $title = [OCUWin32]::WindowTitle($handle) }
     [pscustomobject]@{
         app = [pscustomobject]@{
             name = $process.ProcessName
             bundleIdentifier = $process.ProcessName
             pid = [int]$process.Id
         }
-        windowHandle = [long]$process.MainWindowHandle
-        windowTitle = Limit-Text $process.MainWindowTitle $TextLimit
+        windowHandle = [long]$handle
+        otherWindows = @(Get-OtherWindows $query ([long]$handle))
+        windowTitle = Limit-Text $title $TextLimit
         windowBounds = $bounds
         screenshotPngBase64 = $image
         treeLines = @($rendered.lines)
@@ -1088,31 +1231,45 @@ function Get-AllElements($root) {
     return $items.ToArray()
 }
 
+# pi-phone fork: the live element the snapshot's record names, or a stale_ref refusal. Never acts on
+# a re-numbered element: the element with the recorded UIA RuntimeId must still be the one the snapshot
+# saw (role, name, actions); without a RuntimeId only one unambiguous match counts.
 function Find-Element($process, $record) {
     if ($null -eq $record) {
         return $null
     }
     $root = Get-MainElement $process
-    foreach ($element in (Get-AllElements $root)) {
-        try {
-            if (Same-RuntimeId @($element.GetRuntimeId()) @($record.runtimeId)) {
-                return $element
+    $runtimeId = @($record.runtimeId)
+    if ($runtimeId.Count -gt 0) {
+        foreach ($element in (Get-AllElements $root)) {
+            $same = $false
+            try { $same = Same-RuntimeId @($element.GetRuntimeId()) $runtimeId } catch {}
+            if ($same) {
+                if (Test-RecordMatches (Get-LiveIdentity $element) $record) {
+                    return $element
+                }
+                throw (New-StaleElementError $record "it changed")
             }
-        } catch {
         }
+        throw (New-StaleElementError $record "it went away")
     }
+    $candidates = New-Object System.Collections.Generic.List[object]
     foreach ($element in (Get-AllElements $root)) {
         try {
             $sameAutomationId = -not [string]::IsNullOrWhiteSpace($record.automationId) -and $element.Current.AutomationId -eq $record.automationId
             $sameName = -not [string]::IsNullOrWhiteSpace($record.name) -and $element.Current.Name -eq $record.name
             $sameType = $element.Current.ControlType.ProgrammaticName -eq $record.controlType
             if (($sameAutomationId -or $sameName) -and $sameType) {
-                return $element
+                $candidates.Add($element)
             }
         } catch {
         }
     }
-    return $null
+    if ($candidates.Count -eq 1) { return $candidates[0] }
+    if ($candidates.Count -gt 1) {
+        throw (New-OCUError "ambiguous_target" ("[{0}] matches {1} elements now ({2} '{3}')." -f $record.index, $candidates.Count, $record.controlType, $record.name))
+    }
+    throw (New-StaleElementError $record "it went away")
 }
 
 function Get-CurrentPatternOrNull($element, $pattern) {
@@ -1252,7 +1409,7 @@ function Test-TextWindowHandleCandidate($process, $element) {
         return $false
     }
     $handle = Get-NativeWindowHandle $element
-    if ($handle -eq [IntPtr]::Zero -or $handle -eq [IntPtr]$process.MainWindowHandle) {
+    if ($handle -eq [IntPtr]::Zero -or $handle -eq (Get-TargetHandle $process)) {
         return $false
     }
     $controlType = Get-ElementControlTypeName $element
@@ -1326,14 +1483,23 @@ try {
         $response = [pscustomobject]@{ ok = $true; text = (List-Apps) }
     } elseif ($operation.tool -eq "get_app_state") {
         $observation = Resolve-ObservationOptions $operation
+        $script:TargetProcess = $null
+        $target = Resolve-TargetWindow $operation $false
+        if ($null -ne $target) { $script:TargetWindow = $target.hwnd; $script:TargetProcess = $target.process }
         $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app (Resolve-TextLimit $operation.text_limit) ([int]$operation.max_tree_nodes) ([int]$operation.max_tree_depth) $observation.include_ax $observation.include_screenshot) }
     } else {
-        $process = Resolve-App $operation.app
-        $hwnd = [IntPtr]$process.MainWindowHandle
-        if (($operation.expected_pid -gt 0 -and $process.Id -ne $operation.expected_pid) -or
-            ($operation.windowHandle -gt 0 -and [long]$hwnd -ne $operation.windowHandle)) {
-            throw (New-OCUError "stale_ref" "Target process/window changed; run get_app_state before acting.")
+        # pi-phone fork: act in the snapshot's window (stale_ref when it is gone or replaced).
+        $target = Resolve-TargetWindow $operation $true
+        if ($null -ne $target) {
+            $process = $target.process
+            $script:TargetWindow = $target.hwnd
+        } else {
+            $process = Resolve-App $operation.app
+            if ($operation.expected_pid -gt 0 -and $process.Id -ne $operation.expected_pid) {
+                throw (New-OCUError "stale_ref" "Target process changed; run get_app_state before acting.")
+            }
         }
+        $hwnd = Get-TargetHandle $process
         $windowBounds = $operation.windowBounds
         $element = Find-Element $process $operation.element
         $script:AllowPasswordInputThisCall = ($operation.allow_password_input -is [bool]) -and $operation.allow_password_input
@@ -1452,6 +1618,13 @@ try {
         }
 
         Start-Sleep -Milliseconds 120
+        # The read after an action follows the app's main window, as upstream, unless the call named a window.
+        $script:TargetProcess = $null
+        if (-not ($operation.explicit_window -is [bool] -and $operation.explicit_window)) {
+            $script:TargetWindow = [IntPtr]::Zero
+        } elseif ($null -ne $target) {
+            $script:TargetProcess = $target.process
+        }
         $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app) }
     }
 } catch {

@@ -180,6 +180,7 @@ class RuntimeSelectiveObservationTests(unittest.TestCase):
         self.patches = []
         for name, value in {
             "resolve_app": self.app,
+            "matching_apps": [self.app],
             "main_window": (0, self.window),
             "extents": {"x": 1, "y": 2, "width": 300, "height": 200},
             "node_pid": 42,
@@ -187,6 +188,8 @@ class RuntimeSelectiveObservationTests(unittest.TestCase):
             "render_tree": ([{"index": 7}], ["tree"]),
             "focus_details": ("focus", "selection", False),
             "capture_window_png": "png",
+            "window_id_of": "42:6",
+            "other_windows": [],
         }.items():
             patch = mock.patch.object(self.runtime, name, return_value=value)
             self.patches.append(patch)
@@ -405,13 +408,14 @@ class FocusDetailsTests(unittest.TestCase):
         self.assertEqual(self.runtime.focus_details(self.node(focused=True)), ("text Editor", None, False))
 
     def test_snapshot_reports_focus_budget_exhaustion(self):
-        with mock.patch.object(self.runtime, "resolve_app"), \
+        with mock.patch.object(self.runtime, "matching_apps", return_value=[object()]), \
              mock.patch.object(self.runtime, "main_window", return_value=(0, self.node())), \
              mock.patch.object(self.runtime, "extents"), \
              mock.patch.object(self.runtime, "render_tree", return_value=([], [])), \
              mock.patch.object(self.runtime, "focus_details", return_value=(None, None, True)) as focus, \
              mock.patch.object(self.runtime, "node_pid", return_value=42), \
              mock.patch.object(self.runtime, "node_name", return_value="Editor"), \
+             mock.patch.object(self.runtime, "other_windows", return_value=[]), \
              mock.patch.object(self.runtime, "capture_window_png"):
             state = self.runtime.build_snapshot("Editor", max_tree_nodes=5, max_tree_depth=2)
         self.assertIn("incomplete", state["treeLines"][0])
@@ -584,6 +588,124 @@ class PasswordFieldTests(unittest.TestCase):
                               ("Return", False), ("ctrl+a", False), ("alt+F4", False), ("BackSpace", False)):
             with self.subTest(key=key):
                 self.assertEqual(self.runtime.types_character(key), expected)
+
+
+def rect(x, y, width, height):
+    return {"x": float(x), "y": float(y), "width": float(width), "height": float(height)}
+
+
+class WindowIdSnapshotTests(unittest.TestCase):
+    """pi-phone fork: a read names its window and the other windows the app query matches."""
+
+    def test_snapshot_reports_its_window_and_the_others(self):
+        runtime = load_runtime()
+        with mock.patch.object(runtime, "matching_apps", return_value=[]), \
+             mock.patch.object(runtime, "resolve_target", return_value=(object(), 0, object())), \
+             mock.patch.object(runtime, "extents", return_value=rect(100, 100, 400, 300)), \
+             mock.patch.object(runtime, "node_pid", return_value=42), \
+             mock.patch.object(runtime, "node_name", return_value="Pi OCU Demo"), \
+             mock.patch.object(runtime, "window_id_of", return_value="42:6"), \
+             mock.patch.object(runtime, "other_windows", return_value=[{"id": "43:9", "title": "Other", "app": "x"}]), \
+             mock.patch.object(runtime, "capture_window_png", return_value="png"):
+            state = runtime.build_snapshot("demo", include_ax=False)
+        self.assertEqual((state["windowId"], state["otherWindows"][0]["id"]), ("42:6", "43:9"))
+
+
+class StaleRefTests(unittest.TestCase):
+    """pi-phone fork: never act on a re-numbered element or in a replaced window."""
+
+    def setUp(self):
+        self.runtime = load_runtime()
+        self.nodes = {}
+
+    def node(self, role, name, path, actions=("click",), children=()):
+        node = mock.Mock()
+        node.get_role_name.return_value = role
+        node.get_name.return_value = name
+        node.path = path
+        node.get_child_count.return_value = len(children)
+        node.get_child_at_index.side_effect = lambda index: children[index]
+        node.get_n_actions.return_value = len(actions)
+        node.get_action_name.side_effect = lambda index: actions[index]
+        node.get_action_description.return_value = ""
+        return node
+
+    def record(self, index, role, name, runtime_id, path="", actions=("click",)):
+        return {"index": index, "controlType": role, "name": name, "runtimeId": runtime_id,
+                "actions": list(actions), **({"objectPath": path} if path else {})}
+
+    def list_window(self, names):
+        items = [self.node("list item", name, "/org/a11y/atspi/accessible/" + str(10 + int(name[-1]))) for name in names]
+        listing = self.node("list", "", "/org/a11y/atspi/accessible/9", actions=(), children=items)
+        window = self.node("frame", "Demo", "/org/a11y/atspi/accessible/6", actions=(), children=[listing])
+        app = self.node("application", "demo", "/org/a11y/atspi/accessible/root", actions=(), children=[window])
+        return app, window, items
+
+    def test_the_element_at_the_recorded_path_is_used_when_it_is_the_same(self):
+        app, window, items = self.list_window(["Item 1", "Item 2", "Item 3"])
+        record = self.record(3, "list item", "Item 3", [0, 0, 2], "/org/a11y/atspi/accessible/13")
+        self.assertIs(self.runtime.find_element(app, record, window), items[2])
+
+    def test_a_reversed_list_finds_the_same_object_or_refuses(self):
+        app, window, items = self.list_window(["Item 6", "Item 5", "Item 4", "Item 3", "Item 2", "Item 1"])
+        # The snapshot saw Item 3 at [0, 0, 2]; now Item 4 is there. The object (path …/13) moved to [0, 0, 3].
+        record = self.record(3, "list item", "Item 3", [0, 0, 2], "/org/a11y/atspi/accessible/13")
+        self.assertIs(self.runtime.find_element(app, record, window), items[3])
+        # A new object with the same name (a rebuilt list) is not the element the snapshot saw.
+        rebuilt = dict(record, objectPath="/org/a11y/atspi/accessible/99")
+        with self.assertRaises(self.runtime.OCUError) as refused:
+            self.runtime.find_element(app, rebuilt, window)
+        self.assertEqual(refused.exception.code, "stale_ref")
+        self.assertIn("Item 3", str(refused.exception))
+
+    def test_without_object_paths_a_changed_element_is_refused_and_twins_are_ambiguous(self):
+        app, window, items = self.list_window(["Item 6", "Item 5", "Item 4"])
+        for item in items:
+            item.path = None
+        with self.assertRaises(self.runtime.OCUError) as refused:
+            self.runtime.find_element(app, self.record(3, "list item", "Item 3", [0, 0, 2]), window)
+        self.assertEqual(refused.exception.code, "stale_ref")
+        items[1].get_name.return_value = "Item 4"
+        with self.assertRaises(self.runtime.OCUError) as refused:
+            self.runtime.find_element(app, self.record(3, "list item", "Item 4", [0, 5, 0]), window)
+        self.assertEqual(refused.exception.code, "ambiguous_target")
+
+    def test_changed_actions_or_role_are_stale_and_cut_names_still_match(self):
+        app, window, items = self.list_window(["Item 1", "Item 2"])
+        with self.assertRaises(self.runtime.OCUError):
+            self.runtime.find_element(app, self.record(2, "list item", "Item 2", [0, 0, 1], actions=("activate",)), window)
+        with self.assertRaises(self.runtime.OCUError):
+            self.runtime.find_element(app, self.record(2, "push button", "Item 2", [0, 0, 1]), window)
+        self.assertIs(self.runtime.find_element(app, self.record(2, "list item", "It...", [0, 0, 1]), window), items[1])
+
+    def test_an_action_in_a_replaced_window_is_stale_and_a_read_of_a_missing_one_not_found(self):
+        with mock.patch.object(self.runtime, "find_window", return_value=None), \
+             mock.patch.object(self.runtime, "matching_apps", return_value=[]), \
+             mock.patch.object(self.runtime, "send_key") as pressed:
+            with self.assertRaises(self.runtime.OCUError) as refused:
+                self.runtime.perform_operation({"tool": "press_key", "app": "demo", "key": "Return", "window_id": "42:6"})
+            self.assertEqual(refused.exception.code, "stale_ref")
+            with self.assertRaises(self.runtime.OCUError) as missing:
+                self.runtime.perform_operation({"tool": "get_app_state", "app": "demo", "window_id": "42:6"})
+            self.assertEqual(missing.exception.code, "not_found")
+        pressed.assert_not_called()
+
+    def test_records_carry_the_object_path_and_the_line_is_unchanged(self):
+        node = self.node("check box", "Shout", "/org/a11y/atspi/accessible/3")
+        with mock.patch.object(self.runtime, "relative_frame", return_value=rect(12, 96, 396, 22)), \
+             mock.patch.object(self.runtime, "accessible_id", return_value=""), \
+             mock.patch.object(self.runtime, "element_value", return_value=""):
+            records, lines = self.runtime.render_tree(node, None, [0])
+        self.assertEqual(lines[0], "\t0 check box Shout Secondary Actions: click Frame: {x: 12, y: 96, width: 396, height: 22}")
+        self.assertEqual(records[0]["objectPath"], "/org/a11y/atspi/accessible/3")
+
+    def test_window_ids_name_the_process_and_object(self):
+        app = self.node("application", "demo", "/org/a11y/atspi/accessible/root")
+        app.get_process_id.return_value = 42
+        window = self.node("frame", "Demo", "/org/a11y/atspi/accessible/6")
+        self.assertEqual(self.runtime.window_id_of(app, window), "42:6")
+        window.path = None
+        self.assertEqual(self.runtime.window_id_of(app, window), "")
 
 
 class ErrorCodeTests(unittest.TestCase):

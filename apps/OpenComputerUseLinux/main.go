@@ -50,7 +50,7 @@ type contentItem struct {
 type toolCallResult struct {
 	Content []contentItem `json:"content"`
 	IsError bool          `json:"isError"`
-	// pi-phone fork: code, retry and suggestion of an error.
+	// pi-phone fork: snapshot_id and window_id of a read; code, retry and suggestion of an error.
 	StructuredContent map[string]any `json:"structuredContent,omitempty"`
 }
 
@@ -89,9 +89,19 @@ type elementRecord struct {
 	Actions              []string `json:"actions,omitempty"`
 	// pi-phone fork: a password field (AT-SPI ROLE_PASSWORD_TEXT); its value is never read.
 	IsPassword bool `json:"isPassword,omitempty"`
+	// pi-phone fork: the AT-SPI object path (the element's identity for stale_ref), and whether the
+	// lightweight-hidden mode left out its details.
+	ObjectPath     string `json:"objectPath,omitempty"`
+	DetailsOmitted bool   `json:"detailsOmitted,omitempty"`
 }
 
 type appSnapshot struct {
+	// pi-phone fork: this read's id, its window (<pid>:<AT-SPI object id>) and the other windows the
+	// app matches.
+	ID           string      `json:"-"`
+	WindowID     string      `json:"windowId,omitempty"`
+	OtherWindows []windowRef `json:"otherWindows,omitempty"`
+
 	ScreenshotOmitted   bool            `json:"-"`
 	App                 appDescriptor   `json:"app"`
 	WindowTitle         string          `json:"windowTitle,omitempty"`
@@ -120,6 +130,7 @@ func (s *appSnapshot) renderedText() string {
 		fmt.Sprintf("App=%s (pid %d)", appRef, s.App.PID),
 		fmt.Sprintf("Window: %q, App: %s.", title, s.App.Name),
 	}
+	lines = append(lines, s.piPhoneLines()...)
 	lines = append(lines, s.TreeLines...)
 	if s.ScreenshotOmitted {
 		lines = append(lines, "Screenshot omitted by include_screenshot=false")
@@ -134,7 +145,8 @@ func (s *appSnapshot) renderedText() string {
 
 func (s *appSnapshot) result() toolCallResult {
 	result := toolCallResult{
-		Content: []contentItem{{Type: "text", Text: s.renderedText()}},
+		Content:           []contentItem{{Type: "text", Text: s.renderedText()}},
+		StructuredContent: s.structured(),
 	}
 	if s != nil && s.ScreenshotPNGBase64 != "" {
 		result.Content = append(result.Content, contentItem{
@@ -177,6 +189,23 @@ type linuxRequest struct {
 	// pi-phone fork: this call may type into a password field (the host's person typing
 	// it themselves); without it the guard refuses, unless OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT.
 	AllowPasswordInput bool `json:"allow_password_input,omitempty"`
+
+	// pi-phone fork: the window to read (get_app_state window_id), or the snapshot's window an action
+	// must still find (stale_ref when it is gone); explicit_window pins the read after the action to it.
+	WindowID       string `json:"window_id,omitempty"`
+	ExplicitWindow bool   `json:"explicit_window,omitempty"`
+}
+
+// callOptions are an action's pi-phone fork arguments: snapshot_id and window_id.
+type callOptions struct {
+	refs refArguments
+}
+
+func optionsOf(opts []callOptions) callOptions {
+	if len(opts) == 0 {
+		return callOptions{}
+	}
+	return opts[0]
 }
 
 type textLimit struct {
@@ -203,11 +232,14 @@ type linuxResponse struct {
 
 type service struct {
 	snapshots map[string]*appSnapshot
+	// pi-phone fork: marks of earlier snapshot ids (memory only), to say what replaced them.
+	marks     map[string]snapshotMark
+	markOrder []string
 	runBridge func(linuxRequest) (*linuxResponse, error)
 }
 
 func newService() *service {
-	return &service{snapshots: map[string]*appSnapshot{}, runBridge: runPython}
+	return &service{snapshots: map[string]*appSnapshot{}, marks: map[string]snapshotMark{}, runBridge: runPython}
 }
 
 func (s *service) callTool(name string, args map[string]any) toolCallResult {
@@ -245,7 +277,21 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 		if includeAX != nil && !*includeAX && includeScreenshot != nil && !*includeScreenshot {
 			return errorResult(codeInvalidArgument, "At least one of include_ax or include_screenshot must be true", "")
 		}
-		return s.getAppState(requiredString(args, "app"), textLimit, maxTreeNodes, maxTreeDepth, includeAX, includeScreenshot)
+		refs, err := refArgumentsFrom(args)
+		if err != nil {
+			return invalidArgument(err)
+		}
+		return s.getAppState(requiredString(args, "app"), textLimit, maxTreeNodes, maxTreeDepth, includeAX, includeScreenshot, refs.windowID)
+	}
+
+	// pi-phone fork: every action takes snapshot_id and window_id.
+	refs, err := refArgumentsFrom(args)
+	if err != nil {
+		return invalidArgument(err)
+	}
+	opts := callOptions{refs: refs}
+
+	switch name {
 	case "click":
 		clickMethod, err := parseClickMethod(optionalString(args, "click_method"))
 		if err != nil {
@@ -259,12 +305,14 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 			intValue(optionalFloat(args, "click_count"), 1),
 			defaultString(optionalString(args, "mouse_button"), "left"),
 			clickMethod,
+			opts,
 		)
 	case "perform_secondary_action":
 		return s.performSecondaryAction(
 			requiredString(args, "app"),
 			requiredElementIndex(args),
 			requiredString(args, "action"),
+			opts,
 		)
 	case "scroll":
 		return s.scroll(
@@ -272,6 +320,7 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 			requiredString(args, "direction"),
 			requiredElementIndex(args),
 			floatValue(optionalFloat(args, "pages"), 1),
+			opts,
 		)
 	case "drag":
 		return s.drag(
@@ -280,6 +329,7 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 			requiredFloat(args, "from_y"),
 			requiredFloat(args, "to_x"),
 			requiredFloat(args, "to_y"),
+			opts,
 		)
 	case "type_text":
 		keyMethod, err := parseKeyMethod(optionalString(args, "key_method"))
@@ -290,7 +340,7 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 		if err != nil {
 			return invalidArgument(err)
 		}
-		return s.typeText(requiredString(args, "app"), requiredString(args, "text"), keyMethod, allowPassword)
+		return s.typeText(requiredString(args, "app"), requiredString(args, "text"), keyMethod, allowPassword, opts)
 	case "press_key":
 		keyMethod, err := parseKeyMethod(optionalString(args, "key_method"))
 		if err != nil {
@@ -300,13 +350,13 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 		if err != nil {
 			return invalidArgument(err)
 		}
-		return s.pressKey(requiredString(args, "app"), requiredString(args, "key"), keyMethod, allowPassword)
+		return s.pressKey(requiredString(args, "app"), requiredString(args, "key"), keyMethod, allowPassword, opts)
 	case "set_value":
 		allowPassword, err := allowPasswordInput(args)
 		if err != nil {
 			return invalidArgument(err)
 		}
-		return s.setValue(requiredString(args, "app"), requiredElementIndex(args), requiredString(args, "value"), allowPassword)
+		return s.setValue(requiredString(args, "app"), requiredElementIndex(args), requiredString(args, "value"), allowPassword, opts)
 	default:
 		return errorResult(codeInvalidArgument, fmt.Sprintf("unsupportedTool(%q)", name), "")
 	}
@@ -326,11 +376,11 @@ func (s *service) listApps() toolCallResult {
 	return textResult(response.Text, false)
 }
 
-func (s *service) getAppState(app string, textLimit *textLimit, maxTreeNodes, maxTreeDepth *int, includeAX, includeScreenshot *bool) toolCallResult {
+func (s *service) getAppState(app string, textLimit *textLimit, maxTreeNodes, maxTreeDepth *int, includeAX, includeScreenshot *bool, windowID string) toolCallResult {
 	if app == "" {
 		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
-	request := linuxRequest{Tool: "get_app_state", App: app, IncludeAX: includeAX, IncludeScreenshot: includeScreenshot}
+	request := linuxRequest{Tool: "get_app_state", App: app, IncludeAX: includeAX, IncludeScreenshot: includeScreenshot, WindowID: windowID, ExplicitWindow: windowID != ""}
 	if textLimit != nil {
 		request.TextLimit = textLimit.runtimeValue()
 	}
@@ -351,7 +401,8 @@ func (s *service) getAppState(app string, textLimit *textLimit, maxTreeNodes, ma
 	return result
 }
 
-func (s *service) click(app, elementIndex string, x, y *float64, clickCount int, mouseButton, clickMethod string) toolCallResult {
+func (s *service) click(app, elementIndex string, x, y *float64, clickCount int, mouseButton, clickMethod string, options ...callOptions) toolCallResult {
+	opts := optionsOf(options)
 	if app == "" {
 		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
@@ -370,9 +421,9 @@ func (s *service) click(app, elementIndex string, x, y *float64, clickCount int,
 	if clickMethod == "global" && !globalPointerFallbacksEnabled() {
 		return errorResult(codePolicyDenied, "click_method 'global' requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 because it may move the system pointer and change foreground focus", "")
 	}
-	snapshot := s.currentSnapshot(app)
-	if snapshot == nil {
-		return noAppStateResult(app)
+	snapshot, refusal := s.actionSnapshot(app, opts.refs)
+	if refusal != nil {
+		return *refusal
 	}
 	if elementIndex == "" && snapshot.ScreenshotOmitted {
 		return errorResult(codeStaleRef, "Screenshot omitted by include_screenshot=false; request a screenshot before screenshot-coordinate actions.", "Call get_app_state with a screenshot first.")
@@ -394,10 +445,11 @@ func (s *service) click(app, elementIndex string, x, y *float64, clickCount int,
 		}
 		request.Element = record
 	}
-	return s.actionResult(app, request)
+	return s.actionResult(app, s.pinned(request, snapshot, opts))
 }
 
-func (s *service) performSecondaryAction(app, elementIndex, action string) toolCallResult {
+func (s *service) performSecondaryAction(app, elementIndex, action string, options ...callOptions) toolCallResult {
+	opts := optionsOf(options)
 	if app == "" {
 		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
@@ -407,18 +459,19 @@ func (s *service) performSecondaryAction(app, elementIndex, action string) toolC
 	if action == "" {
 		return errorResult(codeInvalidArgument, "Missing required argument: action", "")
 	}
-	snapshot := s.currentSnapshot(app)
-	if snapshot == nil {
-		return noAppStateResult(app)
+	snapshot, refusal := s.actionSnapshot(app, opts.refs)
+	if refusal != nil {
+		return *refusal
 	}
 	record, err := lookupElement(snapshot, elementIndex)
 	if err != nil {
 		return unknownElementResult(err)
 	}
-	return s.actionResult(app, linuxRequest{Tool: "perform_secondary_action", App: app, Element: record, Action: action})
+	return s.actionResult(app, s.pinned(linuxRequest{Tool: "perform_secondary_action", App: app, Element: record, Action: action}, snapshot, opts))
 }
 
-func (s *service) scroll(app, direction, elementIndex string, pages float64) toolCallResult {
+func (s *service) scroll(app, direction, elementIndex string, pages float64, options ...callOptions) toolCallResult {
+	opts := optionsOf(options)
 	if app == "" {
 		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
@@ -432,18 +485,19 @@ func (s *service) scroll(app, direction, elementIndex string, pages float64) too
 	if pages <= 0 {
 		return errorResult(codeInvalidArgument, "pages must be > 0", "")
 	}
-	snapshot := s.currentSnapshot(app)
-	if snapshot == nil {
-		return noAppStateResult(app)
+	snapshot, refusal := s.actionSnapshot(app, opts.refs)
+	if refusal != nil {
+		return *refusal
 	}
 	record, err := lookupElement(snapshot, elementIndex)
 	if err != nil {
 		return unknownElementResult(err)
 	}
-	return s.actionResult(app, linuxRequest{Tool: "scroll", App: app, Element: record, Direction: normalized, Pages: pages})
+	return s.actionResult(app, s.pinned(linuxRequest{Tool: "scroll", App: app, Element: record, Direction: normalized, Pages: pages}, snapshot, opts))
 }
 
-func (s *service) drag(app string, fromX, fromY, toX, toY *float64) toolCallResult {
+func (s *service) drag(app string, fromX, fromY, toX, toY *float64, options ...callOptions) toolCallResult {
+	opts := optionsOf(options)
 	if app == "" {
 		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
@@ -459,17 +513,18 @@ func (s *service) drag(app string, fromX, fromY, toX, toY *float64) toolCallResu
 	if toY == nil {
 		return errorResult(codeInvalidArgument, "Missing required argument: to_y", "")
 	}
-	snapshot := s.currentSnapshot(app)
-	if snapshot == nil {
-		return noAppStateResult(app)
+	snapshot, refusal := s.actionSnapshot(app, opts.refs)
+	if refusal != nil {
+		return *refusal
 	}
 	if snapshot.ScreenshotOmitted {
 		return errorResult(codeStaleRef, "Screenshot omitted by include_screenshot=false; request a screenshot before screenshot-coordinate actions.", "Call get_app_state with a screenshot first.")
 	}
-	return s.actionResult(app, linuxRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, WindowBounds: snapshot.WindowBounds})
+	return s.actionResult(app, s.pinned(linuxRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, WindowBounds: snapshot.WindowBounds}, snapshot, opts))
 }
 
-func (s *service) typeText(app, text, keyMethod string, allowPassword bool) toolCallResult {
+func (s *service) typeText(app, text, keyMethod string, allowPassword bool, options ...callOptions) toolCallResult {
+	opts := optionsOf(options)
 	if app == "" {
 		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
@@ -479,13 +534,15 @@ func (s *service) typeText(app, text, keyMethod string, allowPassword bool) tool
 	if keyMethod == "sky_key" {
 		return errorResult(codeInvalidArgument, "key_method 'sky_key' is not supported on Linux", "")
 	}
-	if s.currentSnapshot(app) == nil {
-		return noAppStateResult(app)
+	snapshot, refusal := s.actionSnapshot(app, opts.refs)
+	if refusal != nil {
+		return *refusal
 	}
-	return s.actionResult(app, linuxRequest{Tool: "type_text", App: app, Text: text, AllowPasswordInput: allowPassword})
+	return s.actionResult(app, s.pinned(linuxRequest{Tool: "type_text", App: app, Text: text, AllowPasswordInput: allowPassword}, snapshot, opts))
 }
 
-func (s *service) pressKey(app, key, keyMethod string, allowPassword bool) toolCallResult {
+func (s *service) pressKey(app, key, keyMethod string, allowPassword bool, options ...callOptions) toolCallResult {
+	opts := optionsOf(options)
 	if app == "" {
 		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
@@ -495,28 +552,38 @@ func (s *service) pressKey(app, key, keyMethod string, allowPassword bool) toolC
 	if keyMethod == "sky_key" {
 		return errorResult(codeInvalidArgument, "key_method 'sky_key' is not supported on Linux", "")
 	}
-	if s.currentSnapshot(app) == nil {
-		return noAppStateResult(app)
+	snapshot, refusal := s.actionSnapshot(app, opts.refs)
+	if refusal != nil {
+		return *refusal
 	}
-	return s.actionResult(app, linuxRequest{Tool: "press_key", App: app, Key: key, AllowPasswordInput: allowPassword})
+	return s.actionResult(app, s.pinned(linuxRequest{Tool: "press_key", App: app, Key: key, AllowPasswordInput: allowPassword}, snapshot, opts))
 }
 
-func (s *service) setValue(app, elementIndex, value string, allowPassword bool) toolCallResult {
+func (s *service) setValue(app, elementIndex, value string, allowPassword bool, options ...callOptions) toolCallResult {
+	opts := optionsOf(options)
 	if app == "" {
 		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
 	if elementIndex == "" {
 		return errorResult(codeInvalidArgument, "Missing required argument: element_index", "")
 	}
-	snapshot := s.currentSnapshot(app)
-	if snapshot == nil {
-		return noAppStateResult(app)
+	snapshot, refusal := s.actionSnapshot(app, opts.refs)
+	if refusal != nil {
+		return *refusal
 	}
 	record, err := lookupElement(snapshot, elementIndex)
 	if err != nil {
 		return unknownElementResult(err)
 	}
-	return s.actionResult(app, linuxRequest{Tool: "set_value", App: app, Element: record, Value: value, AllowPasswordInput: allowPassword})
+	return s.actionResult(app, s.pinned(linuxRequest{Tool: "set_value", App: app, Element: record, Value: value, AllowPasswordInput: allowPassword}, snapshot, opts))
+}
+
+// pinned points an action at the snapshot's window (the runtime refuses with stale_ref when it is
+// gone); with an explicit window_id the read after it stays on that window too.
+func (s *service) pinned(request linuxRequest, snapshot *appSnapshot, opts callOptions) linuxRequest {
+	request.WindowID = snapshot.WindowID
+	request.ExplicitWindow = opts.refs.windowID != ""
+	return request
 }
 
 func unknownElementResult(err error) toolCallResult {
@@ -593,6 +660,13 @@ func (s *service) refreshSnapshot(app string, request linuxRequest) (*appSnapsho
 }
 
 func (s *service) rememberSnapshot(query string, snapshot *appSnapshot) {
+	if snapshot.ID == "" {
+		snapshot.ID = newSnapshotID()
+	}
+	if s.marks == nil {
+		s.marks = map[string]snapshotMark{}
+	}
+	s.mark(s.currentSnapshot(query), snapshot)
 	keys := []string{query, snapshot.App.Name, snapshot.App.BundleIdentifier, strconv.Itoa(snapshot.App.PID)}
 	for _, key := range keys {
 		key = strings.ToLower(strings.TrimSpace(key))
@@ -1309,7 +1383,7 @@ func globalPointerFallbacksEnabled() bool {
 }
 
 func toolDefinitions() []toolDefinition {
-	return []toolDefinition{
+	return withPiPhoneProperties([]toolDefinition{
 		{
 			Name:        "click",
 			Description: "Click an element by index or pixel coordinates from screenshot. This tool is part of plugin `Computer Use`.",
@@ -1411,7 +1485,7 @@ func toolDefinitions() []toolDefinition {
 				"allow_password_input": allowPasswordProperty,
 			}, []string{"app", "text"}),
 		},
-	}
+	})
 }
 
 // pi-phone fork: the per-call opt-out of the password-field guard.

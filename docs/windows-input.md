@@ -30,6 +30,7 @@ go -C apps/OpenComputerUseWindows build -o "$env:TEMP/ocu-input.exe" .
 powershell.exe -NoProfile -File scripts/tests/windows-input.test.ps1 -RuntimePath apps/OpenComputerUseWindows/runtime.ps1
 powershell.exe -NoProfile -File scripts/tests/windows-pi-phone.test.ps1 -RuntimePath apps/OpenComputerUseWindows/runtime.ps1
 pwsh -File scripts/tests/windows-input-smoke.ps1 -NativePath "$env:TEMP/ocu-input.exe"
+pwsh -File scripts/tests/windows-pi-phone-smoke.ps1 -NativePath "$env:TEMP/ocu-input.exe"
 ```
 
 桌面测试需要已登录 Windows 会话、Windows PowerShell、pwsh 和 Node.js，只操作自有临时窗口。验证默认窗口消息滚动回退、四向滚轮、截图坐标点击、拖拽、组合键、输入释放、移动 / 遮挡拒绝、屏幕右侧捕获与 Worker JS。夹具自定义 WM_MOUSEWHEEL / WM_MOUSEHWHEEL 处理并更新真实 ScrollViewer 偏移，结果由独立状态文件确认；不代表所有 GUI toolkit 都响应窗口消息。

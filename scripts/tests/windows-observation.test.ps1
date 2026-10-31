@@ -17,8 +17,11 @@ foreach ($function in $functions) { Invoke-Expression $function.Extent.Text }
 $DefaultTextLimit = 500
 $AccessibilityTreeMaxNodeCount = 1200
 $AccessibilityTreeMaxDepth = 64
-function Resolve-App($query) { [pscustomobject]@{ ProcessName = $query; Id = 42; MainWindowTitle = "Fixture" } }
+function Resolve-App($query) { [pscustomobject]@{ ProcessName = $query; Id = 42; MainWindowTitle = "Fixture"; MainWindowHandle = 4242 } }
 function Get-MainElement($process) { "window" }
+# pi-phone fork: the target window and the other windows the query matches.
+function Get-TargetHandle($process) { [IntPtr]4242 }
+function Get-OtherWindows($query, $chosen) { @() }
 function Get-WindowBounds($process, $element) { [pscustomobject]@{ x = 0; y = 0; width = 300; height = 200 } }
 function Limit-Text($text, $limit) { $text }
 function Render-Tree($element, $bounds, $limit, $nodes, $depth) {
@@ -47,6 +50,7 @@ foreach ($mode in @(
                 $null -eq $snapshot.focusedSummary -and $null -eq $snapshot.selectedText) "AX was not omitted"
     }
     Assert (($snapshot.screenshotPngBase64 -eq "png") -eq $mode.image) "Screenshot mode mismatch"
+    Assert ($snapshot.windowHandle -eq 4242) "Window handle mismatch"
 }
 
 $defaults = Resolve-ObservationOptions ('{}' | ConvertFrom-Json)

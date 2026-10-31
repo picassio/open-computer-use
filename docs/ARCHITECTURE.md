@@ -128,7 +128,7 @@
 - 这 9 个 tool 的协议面与 macOS 主线保持一致：`list_apps`、`get_app_state`、`click`、`perform_secondary_action`、`scroll`、`drag`、`type_text`、`press_key`、`set_value`。其中 element-targeted action 会优先复用上一轮 `get_app_state` 的 runtime id / automation metadata，coordinate action 使用 screenshot/window-relative 坐标。
 - Windows `click_method=accessibility` 使用 UIA，`app_post` 始终使用 HWND 消息。`click_method=global` 要求 `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1`；开启后，auto 点击及 scroll 的 UIA 失败回退、drag 也可使用真实指针。`press_key` 的 auto 始终使用窗口消息，真实按键需显式 `key_method=global` 及同一环境开关。物理输入通过 SendInput 检查返回值、finally 释放按键 / 鼠标，核对观察的 PID / HWND、最新几何、前台及坐标命中窗口；普通 SetForegroundWindow 失败就拒绝，不模拟 Alt 强行抢前台。macOS-only sky_click / sky_key 继续明确拒绝。见 [Windows 输入说明](windows-input.md)。
 - Windows UI Automation 需要运行在已登录用户的桌面 session 里。通过 SSH 作为脱离桌面的后台进程运行时，PowerShell 可以启动并返回 JSON，但系统可能不给它暴露顶层窗口；这种情况下 `list_apps` 会是空，`get_app_state` 可能返回 `appNotFound(...)`。
-- pi-phone fork（PP-270）：错误带 `Error:` 行。见 [PI-PHONE.md](../PI-PHONE.md)。
+- pi-phone fork（PP-270）：观察输出 `Snapshot:` / `Window id:` 行；动作按 snapshot 窗口与 UIA RuntimeId 重新确认目标（`stale_ref`）；错误带 `Error:` 行。见 [PI-PHONE.md](../PI-PHONE.md)。
 - Windows 已有独立 WPF 观察 fixture 和 Windows PR smoke，覆盖观察、滚动、物理输入及截图边界。其余工具 / toolkit 覆盖，以及 visual cursor overlay、installer/onboarding、code signing 仍待补齐。后续 TODO 记录在 `docs/exec-plans/active/20260422-windows-computer-use-runtime.md`。
 
 ### 7. Linux Runtime
@@ -144,7 +144,7 @@
 - `OPEN_COMPUTER_USE_LINUX_LIGHTWEIGHT_HIDDEN=1` 可省略明确非 SHOWING 节点的位置、值等详情，保留节点、索引及子树；默认关闭，未知状态继续完整读取。使用方式与真实 GTK 验证见 [Linux 隐藏控件详情](linux-hidden-details.md)。
 - 这 9 个 tool 的协议面与 macOS / Windows 保持一致：`list_apps`、`get_app_state`、`click`、`perform_secondary_action`、`scroll`、`drag`、`type_text`、`press_key`、`set_value`。其中 element-targeted action 会优先复用上一轮 `get_app_state` 的 runtime path metadata，coordinate action 使用 screenshot/window-relative 坐标。
 - Linux `click_method=accessibility` 映射到 AT-SPI action，`global` 映射到 AT-SPI mouse synthesis 并要求全局指针环境变量；AT-SPI 没有等价的进程定向 mouse dispatch，因此 `app_post` 和 macOS-only 的 `sky_click` 会在 snapshot lookup 前明确返回 unsupported，`key_method=sky_key` 也一样。`auto` 仍保持 AT-SPI action 优先、mouse synthesis fallback 的现有行为。
-- pi-phone fork（PP-270）：错误带 `Error:` 行。见 [PI-PHONE.md](../PI-PHONE.md)。
+- pi-phone fork（PP-270）：观察输出 `Snapshot:` / `Window id:` 行；动作按 snapshot 窗口与 AT-SPI 对象路径重新确认目标（`stale_ref`）；错误带 `Error:` 行。见 [PI-PHONE.md](../PI-PHONE.md)。
 - Linux 动作回读已有独立 GTK fixture，可在私有 D-Bus / Xvfb 中通过 native MCP 复测；运行方式见 [Linux 动作回读](linux-action-read-back.md)。当前 Linux 侧仍是功能性第一版：没有 visual cursor overlay、没有 installer/desktop entry，也没有覆盖全部工具的 Linux fixture。后续 TODO 记录在 `docs/exec-plans/active/20260422-linux-computer-use-runtime.md`。
 
 ## macOS Locked Use 实验
