@@ -19,8 +19,9 @@ $AccessibilityTreeMaxNodeCount = 1200
 $AccessibilityTreeMaxDepth = 64
 function Resolve-App($query) { [pscustomobject]@{ ProcessName = $query; Id = 42; MainWindowTitle = "Fixture"; MainWindowHandle = 4242 } }
 function Get-MainElement($process) { "window" }
-# pi-phone fork: the target window and the other windows the query matches.
+# pi-phone fork: the target window, its cover and the other windows the query matches.
 function Get-TargetHandle($process) { [IntPtr]4242 }
+function Get-WindowCover($hwnd, $bounds) { $script:calls.cover += 1; [pscustomobject]@{ state = "clear"; covered = @(); visible = $bounds } }
 function Get-OtherWindows($query, $chosen) { @() }
 function Get-WindowBounds($process, $element) { [pscustomobject]@{ x = 0; y = 0; width = 300; height = 200 } }
 function Limit-Text($text, $limit) { $text }
@@ -38,7 +39,7 @@ foreach ($mode in @(
     @{ ax = $true; image = $false },
     @{ ax = $false; image = $true }
 )) {
-    $script:calls = @{ tree = 0; focus = 0; selection = 0; capture = 0 }
+    $script:calls = @{ tree = 0; focus = 0; selection = 0; capture = 0; cover = 0 }
     $snapshot = Build-Snapshot "Fixture" -IncludeAX $mode.ax -IncludeScreenshot $mode.image
     Assert ($snapshot.app.pid -eq 42 -and $snapshot.windowBounds.width -eq 300) "Window metadata missing"
     Assert ($script:calls.tree -eq [int]$mode.ax -and $script:calls.focus -eq [int]$mode.ax -and
@@ -50,7 +51,7 @@ foreach ($mode in @(
                 $null -eq $snapshot.focusedSummary -and $null -eq $snapshot.selectedText) "AX was not omitted"
     }
     Assert (($snapshot.screenshotPngBase64 -eq "png") -eq $mode.image) "Screenshot mode mismatch"
-    Assert ($snapshot.windowHandle -eq 4242) "Window handle mismatch"
+    Assert ($script:calls.cover -eq [int]$mode.image -and $snapshot.windowHandle -eq 4242) "Cover check or window handle mismatch"
 }
 
 $defaults = Resolve-ObservationOptions ('{}' | ConvertFrom-Json)

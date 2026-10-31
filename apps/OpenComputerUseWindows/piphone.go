@@ -1,6 +1,7 @@
 package main
 
-// pi-phone fork (PP-270): structured errors and snapshot-scoped refs. See PI-PHONE.md.
+// pi-phone fork (PP-270): structured errors, snapshot-scoped refs and covered window regions.
+// See PI-PHONE.md.
 
 import (
 	"crypto/rand"
@@ -99,8 +100,16 @@ type snapshotMark struct {
 
 const keptSnapshotMarks = 64
 
-// piPhoneLines are the outline lines after "Window:": the snapshot id, the window id and the other
-// windows the app matches.
+func renderFrames(frames []frame) string {
+	parts := make([]string, 0, len(frames))
+	for _, f := range frames {
+		parts = append(parts, fmt.Sprintf("{x: %.0f, y: %.0f, width: %.0f, height: %.0f}", f.X, f.Y, f.Width, f.Height))
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+// piPhoneLines are the outline lines after "Window:": the snapshot id, the window id, the other
+// windows the app matches, and what covers the window.
 func (s *appSnapshot) piPhoneLines() []string {
 	lines := []string{"Snapshot: " + s.ID}
 	if s.WindowID != "" {
@@ -112,6 +121,14 @@ func (s *appSnapshot) piPhoneLines() []string {
 			parts = append(parts, fmt.Sprintf("%s %q (%s)", other.ID, other.Title, other.App))
 		}
 		lines = append(lines, "Other windows: "+strings.Join(parts, ", "))
+	}
+	switch s.Cover {
+	case "partial":
+		lines = append(lines, "Covered: "+renderFrames(s.Covered)+" (other windows; blacked out in the screenshot)")
+	case "full":
+		lines = append(lines, "Covered: "+renderFrames(s.Covered)+" (the whole window)")
+	case "unknown":
+		lines = append(lines, "Covered: unknown (the window stacking could not be read)")
 	}
 	return lines
 }
@@ -136,12 +153,47 @@ func parseWindowID(windowID string) (int64, error) {
 	return handle, nil
 }
 
+// coverOmission says why a minimised or fully covered window has no screenshot.
+func (s *appSnapshot) coverOmission() string {
+	switch s.Cover {
+	case "full":
+		return "Screenshot omitted: other windows cover the whole window. Bring it to the front, then read it again."
+	case "minimized":
+		return "Screenshot omitted: the window is minimised. Restore it, then read it again."
+	}
+	return ""
+}
+
 func (s *appSnapshot) structured() map[string]any {
-	result := map[string]any{"snapshot_id": s.ID, "window_id": s.WindowID}
+	covered := s.Covered
+	if covered == nil {
+		covered = []frame{}
+	}
+	result := map[string]any{"snapshot_id": s.ID, "window_id": s.WindowID, "covered": covered}
+	if s.Cover != "" {
+		result["cover"] = s.Cover
+	}
 	if len(s.OtherWindows) > 0 {
 		result["other_windows"] = s.OtherWindows
 	}
 	return result
+}
+
+// coveredAt reports whether a screenshot point (window coordinates) is covered, or the window is.
+func (s *appSnapshot) coveredAt(x, y float64) bool {
+	if s.Cover == "full" || s.Cover == "minimized" {
+		return true
+	}
+	for _, f := range s.Covered {
+		if x >= f.X && x < f.X+f.Width && y >= f.Y && y < f.Y+f.Height {
+			return true
+		}
+	}
+	return false
+}
+
+func coveredPointResult(x, y float64) toolCallResult {
+	return errorResult(codeCovered, fmt.Sprintf("Refused: (%.0f, %.0f) is covered by another window in the last read; the input would land there.", x, y), "")
 }
 
 // refArguments are the optional snapshot_id and window_id of an action.
@@ -202,6 +254,11 @@ var (
 		"type":        "string",
 		"description": "pi-phone build: a Window id from the outline. get_app_state reads that window; an action is refused with stale_ref unless the latest read is of it.",
 	}
+	refuseIfCoveredProperty = map[string]any{
+		"type":        "boolean",
+		"default":     false,
+		"description": "pi-phone build: refuse (covered) instead of returning a screenshot with covered parts blacked out.",
+	}
 )
 
 // withPiPhoneProperties adds the fork's arguments to the tool schemas.
@@ -213,6 +270,7 @@ func withPiPhoneProperties(tools []toolDefinition) []toolDefinition {
 		}
 		properties["window_id"] = windowIDProperty
 		if tool.Name == "get_app_state" {
+			properties["refuse_if_covered"] = refuseIfCoveredProperty
 			continue
 		}
 		properties["snapshot_id"] = snapshotIDProperty

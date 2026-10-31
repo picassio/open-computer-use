@@ -190,6 +190,7 @@ class RuntimeSelectiveObservationTests(unittest.TestCase):
             "capture_window_png": "png",
             "window_id_of": "42:6",
             "other_windows": [],
+            "read_window_cover": {"state": "clear", "covered": []},
         }.items():
             patch = mock.patch.object(self.runtime, name, return_value=value)
             self.patches.append(patch)
@@ -416,6 +417,7 @@ class FocusDetailsTests(unittest.TestCase):
              mock.patch.object(self.runtime, "node_pid", return_value=42), \
              mock.patch.object(self.runtime, "node_name", return_value="Editor"), \
              mock.patch.object(self.runtime, "other_windows", return_value=[]), \
+             mock.patch.object(self.runtime, "read_window_cover", return_value={"state": "clear", "covered": []}), \
              mock.patch.object(self.runtime, "capture_window_png"):
             state = self.runtime.build_snapshot("Editor", max_tree_nodes=5, max_tree_depth=2)
         self.assertIn("incomplete", state["treeLines"][0])
@@ -430,7 +432,8 @@ class RuntimeActionReadBackTests(unittest.TestCase):
         self.stack.enter_context(mock.patch.object(self.runtime, "resolve_app"))
         self.stack.enter_context(mock.patch.object(self.runtime, "main_window", return_value=(0, object())))
         for name in ("extents", "find_element", "send_key", "send_drag", "send_mouse_click",
-                     "invoke_secondary_action", "scroll_element", "insert_text", "set_element_value"):
+                     "invoke_secondary_action", "scroll_element", "insert_text", "set_element_value",
+                     "refuse_covered_points"):
             self.stack.enter_context(mock.patch.object(self.runtime, name))
         self.snapshot = self.stack.enter_context(mock.patch.object(self.runtime, "build_snapshot", return_value={"elements": []}))
         self.sleep = self.stack.enter_context(mock.patch.object(self.runtime.time, "sleep"))
@@ -594,21 +597,102 @@ def rect(x, y, width, height):
     return {"x": float(x), "y": float(y), "width": float(width), "height": float(height)}
 
 
-class WindowIdSnapshotTests(unittest.TestCase):
-    """pi-phone fork: a read names its window and the other windows the app query matches."""
+class CoveredWindowTests(unittest.TestCase):
+    """pi-phone fork (PP-271): what covers a window, from the X11 stacking order."""
 
-    def test_snapshot_reports_its_window_and_the_others(self):
-        runtime = load_runtime()
-        with mock.patch.object(runtime, "matching_apps", return_value=[]), \
-             mock.patch.object(runtime, "resolve_target", return_value=(object(), 0, object())), \
-             mock.patch.object(runtime, "extents", return_value=rect(100, 100, 400, 300)), \
-             mock.patch.object(runtime, "node_pid", return_value=42), \
-             mock.patch.object(runtime, "node_name", return_value="Pi OCU Demo"), \
-             mock.patch.object(runtime, "window_id_of", return_value="42:6"), \
-             mock.patch.object(runtime, "other_windows", return_value=[{"id": "43:9", "title": "Other", "app": "x"}]), \
-             mock.patch.object(runtime, "capture_window_png", return_value="png"):
-            state = runtime.build_snapshot("demo", include_ax=False)
+    def setUp(self):
+        self.runtime = load_runtime()
+        self.bounds = rect(100, 100, 400, 300)
+
+    def entry(self, window_id, r, **flags):
+        return {"id": window_id, "rect": r, "viewable": True, **flags}
+
+    def test_window_above_is_reported_in_window_coordinates(self):
+        stack = [self.entry(1, rect(0, 0, 1280, 800)), self.entry(2, self.bounds), self.entry(3, rect(400, 50, 300, 200))]
+        cover = self.runtime.compute_cover(stack, 2, self.bounds)
+        self.assertEqual(cover, {"state": "partial", "covered": [rect(300, 0, 100, 150)]})
+
+    def test_windows_below_hidden_unmapped_input_only_or_elsewhere_do_not_cover(self):
+        stack = [
+            self.entry(1, rect(0, 0, 1280, 800)),
+            self.entry(2, self.bounds),
+            self.entry(3, rect(100, 100, 50, 50), viewable=False),
+            self.entry(4, rect(100, 100, 50, 50), hidden=True),
+            self.entry(5, rect(100, 100, 50, 50), input_only=True),
+            self.entry(6, rect(100, 100, 50, 50), desktop=1),
+            self.entry(7, rect(900, 600, 50, 50)),
+        ]
+        self.assertEqual(self.runtime.compute_cover(stack, 2, self.bounds, current_desktop=0), {"state": "clear", "covered": []})
+        sticky = stack + [self.entry(8, rect(100, 100, 10, 10), desktop=0xFFFFFFFF)]
+        self.assertEqual(self.runtime.compute_cover(sticky, 2, self.bounds, current_desktop=0)["covered"], [rect(0, 0, 10, 10)])
+
+    def test_full_cover_by_several_windows_and_minimised_and_unknown(self):
+        stack = [self.entry(2, self.bounds), self.entry(3, rect(0, 0, 300, 800)), self.entry(4, rect(250, 0, 800, 800))]
+        self.assertEqual(self.runtime.compute_cover(stack, 2, self.bounds)["state"], "full")
+        minimised = [self.entry(2, self.bounds, viewable=False), self.entry(3, rect(0, 0, 10, 10))]
+        self.assertEqual(self.runtime.compute_cover(minimised, 2, self.bounds), {"state": "minimized", "covered": []})
+        self.assertEqual(self.runtime.compute_cover(stack, 99, self.bounds)["state"], "unknown")
+
+    def test_union_area_counts_overlaps_once(self):
+        self.assertEqual(self.runtime.union_area([rect(0, 0, 10, 10), rect(5, 5, 10, 10)]), 175)
+        self.assertEqual(self.runtime.union_area([]), 0)
+
+    def test_match_client_by_process_title_then_rectangle(self):
+        clients = [
+            {"id": 1, "pid": 42, "name": "Pi OCU Demo", "rect": rect(0, 0, 10, 10)},
+            {"id": 2, "pid": 42, "name": "Other", "rect": rect(100, 100, 400, 300)},
+            {"id": 3, "pid": 7, "name": "Pi OCU Demo", "rect": self.bounds},
+            {"id": 4, "pid": 42, "name": "Pi OCU Demo", "override": True},
+        ]
+        self.assertEqual(self.runtime.match_client(clients, 42, "Pi OCU Demo", self.bounds), 1)
+        self.assertEqual(self.runtime.match_client(clients, 42, "Untitled", self.bounds), 2)
+        twins = [dict(clients[0], rect=self.bounds), dict(clients[0], id=5, rect=rect(0, 0, 9, 9))]
+        self.assertEqual(self.runtime.match_client(twins, 42, "Pi OCU Demo", self.bounds), 1)
+        self.assertIsNone(self.runtime.match_client(twins, 42, "Pi OCU Demo", rect(500, 500, 1, 1)))
+
+    def test_black_out_fills_each_covered_part_clipped_to_the_picture(self):
+        pixbuf = mock.Mock()
+        pixbuf.get_width.return_value = 400
+        pixbuf.get_height.return_value = 300
+        self.runtime.black_out(pixbuf, [rect(300, 0, 150, 150), rect(-10, 250, 20, 100), rect(500, 500, 5, 5)])
+        self.assertEqual(pixbuf.new_subpixbuf.call_args_list, [mock.call(300, 0, 100, 150), mock.call(0, 250, 10, 50)])
+        pixbuf.new_subpixbuf.return_value.fill.assert_called_with(0x000000FF)
+
+    def snapshot(self, cover):
+        with mock.patch.object(self.runtime, "matching_apps", return_value=[]), \
+             mock.patch.object(self.runtime, "resolve_target", return_value=(object(), 0, object())), \
+             mock.patch.object(self.runtime, "extents", return_value=self.bounds), \
+             mock.patch.object(self.runtime, "node_pid", return_value=42), \
+             mock.patch.object(self.runtime, "node_name", return_value="Pi OCU Demo"), \
+             mock.patch.object(self.runtime, "window_id_of", return_value="42:6"), \
+             mock.patch.object(self.runtime, "other_windows", return_value=[{"id": "43:9", "title": "Other", "app": "x"}]), \
+             mock.patch.object(self.runtime, "read_window_cover", return_value=cover), \
+             mock.patch.object(self.runtime, "capture_window_png", return_value="png") as capture:
+            state = self.runtime.build_snapshot("demo", include_ax=False)
+        return state, capture
+
+    def test_snapshot_blacks_out_a_partly_covered_window_and_reports_it(self):
+        state, capture = self.snapshot({"state": "partial", "covered": [rect(300, 0, 100, 150)]})
+        capture.assert_called_once_with(self.bounds, [rect(300, 0, 100, 150)])
+        self.assertEqual((state["cover"], state["covered"], state["screenshotPngBase64"]), ("partial", [rect(300, 0, 100, 150)], "png"))
         self.assertEqual((state["windowId"], state["otherWindows"][0]["id"]), ("42:6", "43:9"))
+
+    def test_snapshot_of_a_fully_covered_or_minimised_window_has_no_picture(self):
+        for cover in ({"state": "full", "covered": [rect(0, 0, 400, 300)]}, {"state": "minimized", "covered": []}):
+            with self.subTest(cover=cover["state"]):
+                state, capture = self.snapshot(cover)
+                capture.assert_not_called()
+                self.assertIsNone(state["screenshotPngBase64"])
+                self.assertEqual(state["cover"], cover["state"])
+
+    def test_physical_input_at_a_covered_point_is_refused(self):
+        with mock.patch.object(self.runtime, "read_window_cover", return_value={"state": "partial", "covered": [rect(300, 0, 100, 150)]}), \
+             mock.patch.object(self.runtime, "node_pid", return_value=42), \
+             mock.patch.object(self.runtime, "node_name", return_value="Pi OCU Demo"):
+            self.runtime.refuse_covered_points(object(), object(), self.bounds, [(150, 150)])
+            with self.assertRaises(self.runtime.OCUError) as refused:
+                self.runtime.refuse_covered_points(object(), object(), self.bounds, [(150, 150), (450, 120)])
+        self.assertEqual(refused.exception.code, "covered")
 
 
 class StaleRefTests(unittest.TestCase):

@@ -1,15 +1,17 @@
 param(
     [Parameter(Mandatory = $true)][string]$StatePath,
+    [switch]$Cover,
     [int]$Left = 80,
     [int]$Top = 80,
     [int]$Width = 600,
     [int]$Height = 460
 )
-# pi-phone fork (PP-270): a WPF window for windows-pi-phone-smoke.ps1.
-# "OCU pi-phone Fixture", a Shout check box and six item buttons. Its state file reports the check box
-# and the last button clicked; commands in "$StatePath.command" (JSON {sequence, kind}) reorder the same
-# buttons (reverse), replace them with new ones in reverse order (rebuild), or close the window and open
-# a new one with the same title (reopen).
+# pi-phone fork (PP-270): WPF windows for windows-pi-phone-smoke.ps1.
+# Without -Cover: "OCU pi-phone Fixture", a Shout check box and six item buttons. Its state file reports
+# the check box and the last button clicked; commands in "$StatePath.command" (JSON {sequence, kind})
+# reorder the same buttons (reverse), replace them with new ones in reverse order (rebuild), or close
+# the window and open a new one with the same title (reopen).
+# With -Cover: "OCU Cover Fixture", a plain red topmost window at Left/Top/Width/Height, to cover it.
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName PresentationFramework
 $stateEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -23,6 +25,18 @@ function Write-State($state) {
 }
 
 $application = New-Object System.Windows.Application
+if ($Cover) {
+    $window = New-Object System.Windows.Window
+    $window.Title = "OCU Cover Fixture"
+    $window.WindowStartupLocation = "Manual"
+    $window.Left = $Left; $window.Top = $Top; $window.Width = $Width; $window.Height = $Height
+    $window.Topmost = $true
+    $window.Background = [System.Windows.Media.Brushes]::Red
+    $window.Add_ContentRendered({ Write-State @{ ready = $true } })
+    $application.ShutdownMode = "OnMainWindowClose"
+    [void]$application.Run($window)
+    return
+}
 
 $state = @{ sequence = 0; checked = $false; clicked = ""; windows = 0 }
 $ui = @{ window = $null; items = $null; check = $null; buttons = @() }

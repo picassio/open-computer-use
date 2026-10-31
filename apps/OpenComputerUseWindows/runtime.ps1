@@ -133,7 +133,7 @@ public static class OCUWin32 {
     [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
 
-    // pi-phone fork (PP-270): window identity and the windows of a process.
+    // pi-phone fork (PP-270): window identity, z-order and what paints above a window.
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
     [DllImport("user32.dll")]
     private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
@@ -145,6 +145,8 @@ public static class OCUWin32 {
     private static extern int GetWindowLong(IntPtr hWnd, int index);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+    [DllImport("dwmapi.dll", EntryPoint = "DwmGetWindowAttribute")]
+    private static extern int DwmGetWindowRect(IntPtr hWnd, int attribute, out RECT value, int valueSize);
 
     public static string WindowTitle(IntPtr hWnd) {
         StringBuilder text = new StringBuilder(512);
@@ -168,6 +170,26 @@ public static class OCUWin32 {
         int cloaked;
         if (DwmGetWindowAttribute(hWnd, 14, out cloaked, 4) == 0 && cloaked != 0) return false;
         return true;
+    }
+
+    // The window's painted rectangle: DWM's extended frame bounds, without the invisible resize borders.
+    public static bool VisibleFrame(IntPtr hWnd, out RECT rect) {
+        if (DwmGetWindowRect(hWnd, 9, out rect, Marshal.SizeOf(typeof(RECT))) != 0 && !GetWindowRect(hWnd, out rect)) return false;
+        return rect.Right > rect.Left && rect.Bottom > rect.Top;
+    }
+
+    // The painted rectangles of the top-level windows above the target, in z-order (EnumWindows goes
+    // from the top); null when the target is not a top-level window.
+    public static RECT[] WindowRectsAbove(IntPtr target) {
+        List<RECT> rects = new List<RECT>();
+        bool found = false;
+        EnumWindows(delegate (IntPtr hWnd, IntPtr unused) {
+            if (hWnd == target) { found = true; return false; }
+            RECT rect;
+            if (Paints(hWnd) && VisibleFrame(hWnd, out rect)) rects.Add(rect);
+            return true;
+        }, IntPtr.Zero);
+        return found ? rects.ToArray() : null;
     }
 
     // The painting, titled top-level windows of a process, from the top.
@@ -299,6 +321,80 @@ function Get-LiveIdentity($element) {
 function New-StaleElementError($record, [string]$why) {
     $role = if ([string]::IsNullOrWhiteSpace($record.controlType)) { "element" } else { [string]$record.controlType }
     return (New-OCUError "stale_ref" ("[{0}] is no longer the {1} '{2}' that the snapshot saw ({3})." -f $record.index, $role, $record.name, $why))
+}
+
+# The area the rectangles cover together, counting overlaps once.
+function Get-UnionArea($rects) {
+    $rects = @($rects)
+    if ($rects.Count -eq 0) { return 0 }
+    $xs = @($rects | ForEach-Object { [double]$_.x; [double]$_.x + [double]$_.width } | Sort-Object -Unique)
+    $ys = @($rects | ForEach-Object { [double]$_.y; [double]$_.y + [double]$_.height } | Sort-Object -Unique)
+    $area = 0.0
+    for ($i = 0; $i -lt $xs.Count - 1; $i++) {
+        for ($j = 0; $j -lt $ys.Count - 1; $j++) {
+            $cx = ($xs[$i] + $xs[$i + 1]) / 2; $cy = ($ys[$j] + $ys[$j + 1]) / 2
+            foreach ($rect in $rects) {
+                if ($cx -ge $rect.x -and $cx -lt ($rect.x + $rect.width) -and $cy -ge $rect.y -and $cy -lt ($rect.y + $rect.height)) {
+                    $area += ($xs[$i + 1] - $xs[$i]) * ($ys[$j + 1] - $ys[$j])
+                    break
+                }
+            }
+        }
+    }
+    return $area
+}
+
+function Get-Overlap($a, $b) {
+    $left = [math]::Max([double]$a.x, [double]$b.x)
+    $top = [math]::Max([double]$a.y, [double]$b.y)
+    $right = [math]::Min([double]$a.x + [double]$a.width, [double]$b.x + [double]$b.width)
+    $bottom = [math]::Min([double]$a.y + [double]$a.height, [double]$b.y + [double]$b.height)
+    if ($right -le $left -or $bottom -le $top) { return $null }
+    return New-Frame $left $top ($right - $left) ($bottom - $top)
+}
+
+# pi-phone fork (PP-271): the parts of the window (bounds, screen pixels) that windows above it
+# cover, in window coordinates; full when they cover all of its painted frame (visible, screen pixels).
+function Get-CoveredRegions($Bounds, $Above, $Visible) {
+    if ($null -eq $Above) { return [pscustomobject]@{ state = "unknown"; covered = @() } }
+    if ($null -eq $Visible) { $Visible = $Bounds }
+    $covered = New-Object System.Collections.Generic.List[object]
+    foreach ($rect in @($Above)) {
+        $overlap = Get-Overlap $rect $Bounds
+        if ($null -eq $overlap) { continue }
+        $local = New-Frame ([math]::Round($overlap.x - $Bounds.x)) ([math]::Round($overlap.y - $Bounds.y)) ([math]::Round($overlap.width)) ([math]::Round($overlap.height))
+        if (-not ($covered | Where-Object { $_.x -eq $local.x -and $_.y -eq $local.y -and $_.width -eq $local.width -and $_.height -eq $local.height })) {
+            $covered.Add($local)
+        }
+    }
+    if ($covered.Count -eq 0) { return [pscustomobject]@{ state = "clear"; covered = @() } }
+    $paintedLocal = New-Frame ($Visible.x - $Bounds.x) ($Visible.y - $Bounds.y) $Visible.width $Visible.height
+    $inPainted = @($covered | ForEach-Object { Get-Overlap $_ $paintedLocal } | Where-Object { $null -ne $_ })
+    $state = "partial"
+    if ((Get-UnionArea $inPainted) -ge ($paintedLocal.width * $paintedLocal.height)) { $state = "full" }
+    return [pscustomobject]@{ state = $state; covered = $covered.ToArray() }
+}
+
+function ConvertFrom-Rect($rect) {
+    return New-Frame $rect.Left $rect.Top ($rect.Right - $rect.Left) ($rect.Bottom - $rect.Top)
+}
+
+# What covers a top-level window now: minimized, or Get-CoveredRegions from the z-order above it.
+function Get-WindowCover([IntPtr]$hwnd, $bounds) {
+    if ([OCUWin32]::IsIconic($hwnd)) { return [pscustomobject]@{ state = "minimized"; covered = @(); visible = $null } }
+    if ($null -eq $bounds) { return [pscustomobject]@{ state = ""; covered = @(); visible = $null } }
+    try {
+        $visible = $null
+        $rect = New-Object OCUWin32+RECT
+        if ([OCUWin32]::VisibleFrame($hwnd, [ref]$rect)) { $visible = ConvertFrom-Rect $rect }
+        $above = [OCUWin32]::WindowRectsAbove($hwnd)
+        $rects = $null
+        if ($null -ne $above) { $rects = @($above | ForEach-Object { ConvertFrom-Rect $_ }) }
+        $cover = Get-CoveredRegions $bounds $rects $visible
+        return [pscustomobject]@{ state = $cover.state; covered = @($cover.covered); visible = $visible }
+    } catch {
+        return [pscustomobject]@{ state = "unknown"; covered = @(); visible = $null }
+    }
 }
 
 # pi-phone fork: the window a call reads or acts in. An action's snapshot window must still exist and
@@ -1076,7 +1172,29 @@ function Render-Tree($element, $windowBounds, $TextLimit = $script:DefaultTextLi
     }
 }
 
-function Capture-WindowPngBase64($bounds) {
+# pi-phone fork (PP-271): a screen copy of the window's rectangle shows whatever paints there, so the
+# parts other windows cover, and the invisible resize borders outside its painted frame, are blacked out.
+function Get-BlackoutRects($bounds, $covered, $visible) {
+    $rects = New-Object System.Collections.Generic.List[object]
+    foreach ($rect in @($covered)) { if ($null -ne $rect) { $rects.Add($rect) } }
+    if ($null -ne $visible) {
+        $left = [math]::Max(0, [double]$visible.x - [double]$bounds.x)
+        $top = [math]::Max(0, [double]$visible.y - [double]$bounds.y)
+        $right = [math]::Min([double]$bounds.width, [double]$visible.x + [double]$visible.width - [double]$bounds.x)
+        $bottom = [math]::Min([double]$bounds.height, [double]$visible.y + [double]$visible.height - [double]$bounds.y)
+        foreach ($strip in @(
+            (New-Frame 0 0 $bounds.width $top),
+            (New-Frame 0 $bottom $bounds.width ($bounds.height - $bottom)),
+            (New-Frame 0 $top $left ($bottom - $top)),
+            (New-Frame $right $top ($bounds.width - $right) ($bottom - $top))
+        )) {
+            if ($null -ne $strip -and $strip.width -gt 0 -and $strip.height -gt 0) { $rects.Add($strip) }
+        }
+    }
+    return $rects.ToArray()
+}
+
+function Capture-WindowPngBase64($bounds, $covered = @(), $visible = $null) {
     if (-not (Test-CapturableFrame $bounds)) {
         return $null
     }
@@ -1087,6 +1205,9 @@ function Capture-WindowPngBase64($bounds) {
         $bitmap = New-Object System.Drawing.Bitmap ([int][math]::Round($bounds.width)), ([int][math]::Round($bounds.height))
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
         $graphics.CopyFromScreen([int][math]::Round($bounds.x), [int][math]::Round($bounds.y), 0, 0, $bitmap.Size)
+        foreach ($rect in (Get-BlackoutRects $bounds $covered $visible)) {
+            $graphics.FillRectangle([System.Drawing.Brushes]::Black, [float]$rect.x, [float]$rect.y, [float]$rect.width, [float]$rect.height)
+        }
         $stream = New-Object System.IO.MemoryStream
         $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
         $bytes = $stream.ToArray()
@@ -1165,14 +1286,21 @@ function Build-Snapshot([string]$query, $TextLimit = $script:DefaultTextLimit, [
     $focus = $null
     $selection = $null
     $image = $null
+    $cover = $null
     if ($IncludeAX) {
         $rendered = Render-Tree $element $bounds $TextLimit $MaxTreeNodes $MaxTreeDepth
         $focus = Get-FocusedSummary $process.Id $TextLimit
         $selection = Get-SelectedText $process.Id $TextLimit
     }
-    if ($IncludeScreenshot) { $image = Capture-WindowPngBase64 $bounds }
+    if ($IncludeScreenshot) {
+        $cover = Get-WindowCover $handle $bounds
+        if ($cover.state -notin @("full", "minimized")) { $image = Capture-WindowPngBase64 $bounds $cover.covered $cover.visible }
+    }
     $title = $process.MainWindowTitle
     if ($handle -ne [IntPtr]$process.MainWindowHandle) { $title = [OCUWin32]::WindowTitle($handle) }
+    $coverState = ""
+    $covered = @()
+    if ($null -ne $cover) { $coverState = $cover.state; $covered = @($cover.covered) }
     [pscustomobject]@{
         app = [pscustomobject]@{
             name = $process.ProcessName
@@ -1181,6 +1309,8 @@ function Build-Snapshot([string]$query, $TextLimit = $script:DefaultTextLimit, [
         }
         windowHandle = [long]$handle
         otherWindows = @(Get-OtherWindows $query ([long]$handle))
+        cover = $coverState
+        covered = $covered
         windowTitle = Limit-Text $title $TextLimit
         windowBounds = $bounds
         screenshotPngBase64 = $image

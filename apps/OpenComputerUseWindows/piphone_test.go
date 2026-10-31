@@ -1,6 +1,6 @@
 package main
 
-// pi-phone fork (PP-270) tests: snapshot ids, stale refs, error codes.
+// pi-phone fork (PP-270) tests: snapshot ids, stale refs, covered regions, error codes.
 
 import (
 	"regexp"
@@ -67,6 +67,7 @@ func demoSnapshot(t *testing.T) *appSnapshot {
 		ScreenshotPNGBase64: pngBase64(t, 400, 300),
 		TreeLines:           []string{"\t0 window Pi OCU Demo", "\t\t1 check box Shout Secondary Actions: Toggle"},
 		Elements:            []elementRecord{{Index: 0, ControlType: "ControlType.Window"}, {Index: 1, ControlType: "ControlType.CheckBox", Name: "Shout", RuntimeID: []int{7, 42, 3}}},
+		Cover:               "clear",
 	}
 }
 
@@ -80,6 +81,8 @@ func serviceWith(responses ...*psResponse) (*service, *fakeBridge) {
 func TestSnapshotLinesAndStructuredResult(t *testing.T) {
 	read := demoSnapshot(t)
 	read.OtherWindows = []windowRef{{ID: "5678", Title: "Other", App: "demo"}}
+	read.Cover = "partial"
+	read.Covered = []frame{{X: 300, Y: 0, Width: 100, Height: 150}}
 	s, _ := serviceWith(&psResponse{OK: true, Snapshot: read})
 	result := s.callTool("get_app_state", map[string]any{"app": "demo"})
 	if result.IsError || len(result.Content) != 2 {
@@ -95,6 +98,7 @@ func TestSnapshotLinesAndStructuredResult(t *testing.T) {
 	want := []string{
 		"Window id: 1234",
 		`Other windows: 5678 "Other" (demo)`,
+		"Covered: [{x: 300, y: 0, width: 100, height: 150}] (other windows; blacked out in the screenshot)",
 		"\t0 window Pi OCU Demo",
 	}
 	for i, line := range want {
@@ -104,7 +108,8 @@ func TestSnapshotLinesAndStructuredResult(t *testing.T) {
 	}
 	id := strings.TrimPrefix(lines[2], "Snapshot: ")
 	structured := result.StructuredContent
-	if structured["snapshot_id"] != id || structured["window_id"] != "1234" {
+	covered, _ := structured["covered"].([]frame)
+	if structured["snapshot_id"] != id || structured["window_id"] != "1234" || len(covered) != 1 || covered[0].X != 300 || structured["cover"] != "partial" {
 		t.Fatalf("structured = %#v", structured)
 	}
 }
@@ -203,18 +208,79 @@ func TestRuntimeRefusalsKeepTheirCode(t *testing.T) {
 	requireCode(t, s.callTool("click", map[string]any{"app": "demo", "element_index": "1", "snapshot_id": 7}), codeInvalidArgument, "safe")
 }
 
+func TestCoordinatesInACoveredPartAreRefused(t *testing.T) {
+	read := demoSnapshot(t)
+	read.Cover = "partial"
+	read.Covered = []frame{{X: 300, Y: 0, Width: 100, Height: 150}}
+	s, bridge := serviceWith(&psResponse{OK: true, Snapshot: read})
+	s.callTool("get_app_state", map[string]any{"app": "demo"})
+	sent := len(bridge.requests)
+	requireCode(t, s.callTool("click", map[string]any{"app": "demo", "x": 350, "y": 20}), codeCovered, "safe")
+	requireCode(t, s.callTool("drag", map[string]any{"app": "demo", "from_x": 10, "from_y": 10, "to_x": 399, "to_y": 149}), codeCovered, "safe")
+	if len(bridge.requests) != sent {
+		t.Fatal("a covered point reached the runtime")
+	}
+	if result := s.callTool("click", map[string]any{"app": "demo", "x": 299, "y": 20}); result.IsError {
+		t.Fatalf("an uncovered point was refused: %#v", result)
+	}
+}
+
+func TestFullyCoveredOrMinimisedWindowsSayWhyThereIsNoScreenshot(t *testing.T) {
+	for cover, want := range map[string]string{
+		"full":      "Screenshot omitted: other windows cover the whole window.",
+		"minimized": "Screenshot omitted: the window is minimised.",
+	} {
+		read := demoSnapshot(t)
+		read.Cover = cover
+		read.ScreenshotPNGBase64 = ""
+		if cover == "full" {
+			read.Covered = []frame{{Width: 400, Height: 300}}
+		} else {
+			read.WindowBounds = nil
+		}
+		s, _ := serviceWith(&psResponse{OK: true, Snapshot: read})
+		result := s.callTool("get_app_state", map[string]any{"app": "demo"})
+		if len(result.Content) != 1 || !strings.Contains(result.Content[0].Text, want) || strings.Contains(result.Content[0].Text, "Screenshot unavailable") {
+			t.Fatalf("%s: %#v", cover, result)
+		}
+		requireCode(t, s.callTool("click", map[string]any{"app": "demo", "x": 5, "y": 5}), codeCovered, "safe")
+	}
+}
+
+func TestRefuseIfCovered(t *testing.T) {
+	read := demoSnapshot(t)
+	read.Cover = "partial"
+	read.Covered = []frame{{X: 300, Y: 0, Width: 100, Height: 150}}
+	s, _ := serviceWith(&psResponse{OK: true, Snapshot: read})
+	refused := s.callTool("get_app_state", map[string]any{"app": "demo", "refuse_if_covered": true})
+	requireCode(t, refused, codeCovered, "safe")
+	if len(refused.Content) != 1 || s.currentSnapshot("demo") != nil {
+		t.Fatalf("a refused read returned a picture or became the latest snapshot: %#v", refused)
+	}
+	for _, cover := range []string{"unknown", "minimized", ""} {
+		read.Cover = cover
+		requireCode(t, s.callTool("get_app_state", map[string]any{"app": "demo", "refuse_if_covered": true}), codeCovered, "safe")
+	}
+	read.Cover, read.Covered = "clear", nil
+	if result := s.callTool("get_app_state", map[string]any{"app": "demo", "refuse_if_covered": true}); result.IsError {
+		t.Fatalf("an uncovered window was refused: %#v", result)
+	}
+	requireCode(t, s.callTool("get_app_state", map[string]any{"app": "demo", "refuse_if_covered": true, "include_screenshot": false}), codeInvalidArgument, "safe")
+}
+
 func TestToolSchemasCarryTheForkArguments(t *testing.T) {
 	for _, tool := range toolDefinitions() {
 		properties := tool.InputSchema["properties"].(map[string]any)
 		_, snapshotID := properties["snapshot_id"]
 		_, windowID := properties["window_id"]
+		_, refuse := properties["refuse_if_covered"]
 		switch tool.Name {
 		case "list_apps":
 			if snapshotID || windowID {
 				t.Fatalf("list_apps: %#v", properties)
 			}
 		case "get_app_state":
-			if !windowID || snapshotID {
+			if !windowID || !refuse || snapshotID {
 				t.Fatalf("get_app_state: %#v", properties)
 			}
 		default:
@@ -225,10 +291,12 @@ func TestToolSchemasCarryTheForkArguments(t *testing.T) {
 	}
 }
 
-// The runtime script carries the fork's guards: coded refusals and stale elements.
+// The runtime script carries the fork's guards: coded refusals, stale elements and the z-order cover
+// check before a screenshot.
 func TestWindowsRuntimeCarriesTheForkGuards(t *testing.T) {
 	for _, needle := range []string{
 		`function New-OCUError`,
+		`$cover = Get-WindowCover $handle $bounds`,
 		`throw (New-StaleElementError $record "it changed")`,
 		`EnumWindows(delegate (IntPtr hWnd, IntPtr unused)`,
 	} {

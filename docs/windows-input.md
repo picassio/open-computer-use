@@ -18,6 +18,8 @@ $env:OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS="1"
 
 原生 MCP / CLI 参数使用 `click_method`、`key_method`。`type_text` 不提供 global 方式；`sky_click` / `sky_key` 是 macOS 能力。
 
+pi-phone fork（PP-270）：坐标落在上次观察中被其他窗口遮挡的区域时以 `covered` 拒绝。见 [PI-PHONE.md](../PI-PHONE.md)。
+
 真实输入会移动系统指针，可能将目标放到前台。发送前核对已观察的进程 / 窗口、当前几何、前台及坐标命中窗口。按索引进行的物理输入还核对 UIA runtime ID 和当前元素位置，拒绝已消失、替换或移动的元素。窗口移动、被其他窗口遮挡或无法切换前台时会报错，需要重新观察或让目标可见。不会模拟 Alt 强行抢前台，也不会在指定 app_post / accessibility 失败时切到真实输入。
 
 按键 / 鼠标用 SendInput，并检查是否插入成功。真实鼠标支持左 / 中 / 右键及 1–3 次点击，拒绝无效按钮和过大的点击次数。组合键先完整校验，再按下；异常时释放本次按下的键 / 按钮。系统完整性级别限制仍适用；进程强制终止也不能保证执行 finally。

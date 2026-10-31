@@ -3,15 +3,20 @@ param([Parameter(Mandatory = $true)][string]$NativePath)
 # - Each read has "Snapshot:" and "Window id:".
 # - An element rebuilt after the read is refused with stale_ref (never acts on another one); an old
 #   snapshot id and a replaced window are refused with stale_ref.
+# - A second, topmost window over part of the fixture: its part is reported ("Covered: [...]") and black
+#   in the screenshot (no red pixels of the cover); refuse_if_covered refuses; a click there is refused.
+#   Over the whole fixture: no screenshot, and the reason.
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "windows-fixture-state.ps1")
 if ($env:OS -ne "Windows_NT") { throw "Windows desktop required" }
+Add-Type -AssemblyName System.Drawing
 $NativePath = (Resolve-Path -LiteralPath $NativePath).Path
 $directory = Join-Path ([System.IO.Path]::GetTempPath()) ("ocu-pi-phone-" + [Guid]::NewGuid())
 [void](New-Item -ItemType Directory -Path $directory)
 $stateFile = Join-Path $directory "state.json"
 $fixtureSource = Join-Path $PSScriptRoot "fixtures/WindowsPiPhoneFixture.ps1"
 $fixture = $null
+$cover = $null
 $native = $null
 $requestId = 0
 $sequence = 0
@@ -68,6 +73,20 @@ function Change-Window($kind) {
     Wait-For { (Read-State).sequence -eq $script:sequence } "fixture command $kind"
     Start-Sleep -Milliseconds 300
 }
+function Start-Cover($left, $top, $width, $height) {
+    if ($null -ne $script:cover -and -not $script:cover.HasExited) { $script:cover.Kill(); $script:cover.WaitForExit() }
+    $coverState = Join-Path $directory ("cover-" + [Guid]::NewGuid() + ".json")
+    $script:cover = Start-Process powershell.exe -ArgumentList @("-NoProfile", "-STA", "-File", "`"$fixtureSource`"", "-StatePath", "`"$coverState`"", "-Cover",
+        "-Left", $left, "-Top", $top, "-Width", $width, "-Height", $height) -PassThru
+    Wait-For { Test-Path -LiteralPath $coverState } "cover window"
+    Start-Sleep -Milliseconds 500
+}
+function Get-Pixels($result) {
+    $image = Image $result
+    Assert ($null -ne $image) ("No screenshot:`n" + (Text $result))
+    $stream = New-Object System.IO.MemoryStream (, [Convert]::FromBase64String($image.data))
+    return New-Object System.Drawing.Bitmap $stream
+}
 try {
     $fixture = Start-Process powershell.exe -ArgumentList @("-NoProfile", "-STA", "-File", "`"$fixtureSource`"", "-StatePath", "`"$stateFile`"") -PassThru -RedirectStandardOutput (Join-Path $directory "fixture.out") -RedirectStandardError (Join-Path $directory "fixture.err")
     Wait-For { Test-Path -LiteralPath $stateFile } "WPF startup"
@@ -85,12 +104,14 @@ try {
     [void]$native.Start()
     $null = Send-Request "initialize" @{ protocolVersion = "2025-03-26"; capabilities = @{}; clientInfo = @{ name = "windows-pi-phone-smoke"; version = "1" } }
 
-    # Snapshot and window ids.
+    # Snapshot and window ids; the uncovered fixture.
     $state = Call-Tool "get_app_state" @{}
     Assert (-not $state.isError) (Text $state)
     $null = Snapshot-Of $state
     Assert ((Text $state) -match "(?m)^Window id: \d+$") ("No Window id: line:`n" + (Text $state))
-    Write-Output "Reads carry Snapshot: and Window id:."
+    Assert ((Text $state) -notmatch "(?m)^Covered:") ("The uncovered fixture was reported covered:`n" + (Text $state))
+    Assert ($null -ne (Image $state)) "No screenshot of the uncovered fixture"
+    Write-Output "Reads carry Snapshot: and Window id:; the uncovered fixture has no Covered: line."
 
     # A rebuilt element is stale; it is never another element.
     $state = Call-Tool "get_app_state" @{ include_screenshot = $false }
@@ -126,6 +147,42 @@ try {
     Assert ((Text $old) -match "replaced by $(Snapshot-Of $second)") (Text $old)
     Write-Output "An old snapshot id is refused with stale_ref."
 
+    # A window over part of the fixture.
+    Start-Cover 380 180 250 150
+    $covered = Call-Tool "get_app_state" @{}
+    Assert (-not $covered.isError) (Text $covered)
+    $match = [regex]::Match((Text $covered), "(?m)^Covered: \[\{x: (\d+), y: (\d+), width: (\d+), height: (\d+)\}")
+    Assert $match.Success ("No Covered: line with the cover window over the fixture:`n" + (Text $covered))
+    $x, $y, $width, $height = 1..4 | ForEach-Object { [int]$match.Groups[$_].Value }
+    $bitmap = Get-Pixels $covered
+    try {
+        $inside = $bitmap.GetPixel($x + [int]($width / 2), $y + [int]($height / 2))
+        Assert ($inside.R -eq 0 -and $inside.G -eq 0 -and $inside.B -eq 0) "The covered part is not black: $inside"
+        $red = 0
+        for ($py = 0; $py -lt $bitmap.Height; $py += 4) {
+            for ($px = 0; $px -lt $bitmap.Width; $px += 4) {
+                $pixel = $bitmap.GetPixel($px, $py)
+                if ($pixel.R -gt 200 -and $pixel.G -lt 60 -and $pixel.B -lt 60) { $red += 1 }
+            }
+        }
+        Assert ($red -eq 0) "The cover window's red shows in the fixture's screenshot ($red samples)"
+        $outside = $bitmap.GetPixel([math]::Max(30, $x - 60), [math]::Min($bitmap.Height - 20, $y + 20))
+        Assert (-not ($outside.R -eq 0 -and $outside.G -eq 0 -and $outside.B -eq 0)) "The uncovered part is black too"
+    } finally { $bitmap.Dispose() }
+    Write-Output "Covered part $x,$y ${width}x$height is reported and black; no cover pixels in the screenshot."
+    Assert-Code (Call-Tool "get_app_state" @{ refuse_if_covered = $true }) "covered" "refuse_if_covered"
+    Assert-Code (Call-Tool "click" @{ x = ($x + 10); y = ($y + 10) }) "covered" "A click in the covered part"
+    Write-Output "refuse_if_covered and a click in the covered part are refused with covered."
+
+    # A window over all of it.
+    Start-Cover 40 40 800 620
+    $hidden = Call-Tool "get_app_state" @{}
+    Assert (-not $hidden.isError -and $null -eq (Image $hidden)) ("A fully covered fixture returned a screenshot:`n" + (Text $hidden))
+    Assert ((Text $hidden) -match "Screenshot omitted: other windows cover the whole window") (Text $hidden)
+    Write-Output "A fully covered window has no screenshot, and says why."
+    $cover.Kill(); $cover.WaitForExit(); $cover = $null
+    Start-Sleep -Milliseconds 300
+
     # A replaced window.
     $state = Call-Tool "get_app_state" @{ include_screenshot = $false }
     $snapshot = Snapshot-Of $state
@@ -141,7 +198,9 @@ try {
         $native.StandardInput.Close()
         if (-not $native.WaitForExit(3000)) { $native.Kill(); $native.WaitForExit() }
     }
-    if ($null -ne $fixture -and -not $fixture.HasExited) { $fixture.Kill(); $fixture.WaitForExit() }
+    foreach ($process in @($cover, $fixture)) {
+        if ($null -ne $process -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
+    }
     $fixtureError = Join-Path $directory "fixture.err"
     if (Test-Path -LiteralPath $fixtureError) { Get-Content -LiteralPath $fixtureError | Write-Output }
     Remove-Item -LiteralPath $directory -Recurse -Force

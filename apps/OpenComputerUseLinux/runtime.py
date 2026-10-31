@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import base64
+import ctypes
 import json
 import math
 import os
@@ -469,7 +470,321 @@ def render_tree(root, window_bounds, root_path, text_limit=DEFAULT_TEXT_LIMIT, m
     return records, lines
 
 
-def capture_window_png(bounds):
+# pi-phone fork (PP-271): a window screenshot is a copy of the screen inside the window's rectangle, so
+# whatever sits above the window shows in it. The X11 stacking order says what is above: those parts are
+# blacked out and reported ("covered"); a minimised or fully covered window gets no picture.
+
+
+def intersect(a, b):
+    """The overlap of two {x, y, width, height} rectangles, or None."""
+    left = max(a["x"], b["x"])
+    top = max(a["y"], b["y"])
+    right = min(a["x"] + a["width"], b["x"] + b["width"])
+    bottom = min(a["y"] + a["height"], b["y"] + b["height"])
+    if right <= left or bottom <= top:
+        return None
+    return frame(left, top, right - left, bottom - top)
+
+
+def union_area(rects):
+    """The area the rectangles cover together, counting overlaps once."""
+    xs = sorted({value for r in rects for value in (r["x"], r["x"] + r["width"])})
+    ys = sorted({value for r in rects for value in (r["y"], r["y"] + r["height"])})
+    area = 0.0
+    for i in range(len(xs) - 1):
+        for j in range(len(ys) - 1):
+            cx, cy = (xs[i] + xs[i + 1]) / 2, (ys[j] + ys[j + 1]) / 2
+            if any(r["x"] <= cx < r["x"] + r["width"] and r["y"] <= cy < r["y"] + r["height"] for r in rects):
+                area += (xs[i + 1] - xs[i]) * (ys[j + 1] - ys[j])
+    return area
+
+
+ALL_DESKTOPS = 0xFFFFFFFF
+
+
+def compute_cover(stack, target_id, bounds, current_desktop=None):
+    """What covers the window's screen rectangle (bounds), from a stacking list ordered bottom to top.
+
+    Each entry: {id, rect, viewable, hidden, input_only, desktop}. Returns {state, covered}, where state is
+    clear, partial, full, minimized or unknown, and covered lists the covered parts in window coordinates.
+    """
+    position = next((i for i, entry in enumerate(stack) if entry["id"] == target_id), None)
+    if position is None or bounds is None:
+        return {"state": "unknown", "covered": []}
+    target = stack[position]
+    if not target.get("viewable", True) or target.get("hidden"):
+        return {"state": "minimized", "covered": []}
+    covered = []
+    for entry in stack[position + 1:]:
+        if not entry.get("viewable", True) or entry.get("hidden") or entry.get("input_only"):
+            continue
+        desktop = entry.get("desktop")
+        if desktop is not None and desktop != ALL_DESKTOPS and current_desktop is not None and desktop != current_desktop:
+            continue
+        overlap = intersect(entry["rect"], bounds)
+        if overlap is None:
+            continue
+        local = frame(
+            round(overlap["x"] - bounds["x"]),
+            round(overlap["y"] - bounds["y"]),
+            round(overlap["width"]),
+            round(overlap["height"]),
+        )
+        if local not in covered:
+            covered.append(local)
+    if not covered:
+        return {"state": "clear", "covered": []}
+    whole = frame(0, 0, round(bounds["width"]), round(bounds["height"]))
+    full = union_area(covered) >= whole["width"] * whole["height"]
+    return {"state": "full" if full else "partial", "covered": covered}
+
+
+def match_client(clients, pid, title, bounds):
+    """The one X11 client window that is this AT-SPI window (same process, then title, then rectangle)."""
+    candidates = [c for c in clients if c.get("pid") == pid and not c.get("override")]
+    named = [c for c in candidates if title and c.get("name") == title]
+    if len(named) == 1:
+        return named[0]["id"]
+    pool = named or candidates
+    if bounds is not None:
+        def near(rect):
+            return rect is not None and all(abs(rect[key] - bounds[key]) <= 2 for key in ("x", "y", "width", "height"))
+        placed = [c for c in pool if near(c.get("client")) or near(c.get("rect"))]
+        if len(placed) == 1:
+            return placed[0]["id"]
+    if len(pool) == 1:
+        return pool[0]["id"]
+    return None
+
+
+class _XWindowAttributes(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_int), ("y", ctypes.c_int), ("width", ctypes.c_int), ("height", ctypes.c_int),
+        ("border_width", ctypes.c_int), ("depth", ctypes.c_int), ("visual", ctypes.c_void_p),
+        ("root", ctypes.c_ulong), ("window_class", ctypes.c_int), ("bit_gravity", ctypes.c_int),
+        ("win_gravity", ctypes.c_int), ("backing_store", ctypes.c_int), ("backing_planes", ctypes.c_ulong),
+        ("backing_pixel", ctypes.c_ulong), ("save_under", ctypes.c_int), ("colormap", ctypes.c_ulong),
+        ("map_installed", ctypes.c_int), ("map_state", ctypes.c_int), ("all_event_masks", ctypes.c_long),
+        ("your_event_mask", ctypes.c_long), ("do_not_propagate_mask", ctypes.c_long),
+        ("override_redirect", ctypes.c_int), ("screen", ctypes.c_void_p),
+    ]
+
+
+_X_ERROR_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+IS_VIEWABLE = 2
+INPUT_ONLY = 2
+
+
+class X11Display:
+    """A small read-only Xlib client (ctypes): window stacking, properties and geometry."""
+
+    def __init__(self):
+        lib = ctypes.CDLL("libX11.so.6")
+        lib.XOpenDisplay.restype = ctypes.c_void_p
+        lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        lib.XDefaultRootWindow.restype = ctypes.c_ulong
+        lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        lib.XInternAtom.restype = ctypes.c_ulong
+        lib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        lib.XGetWindowProperty.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long, ctypes.c_long, ctypes.c_int,
+            ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_void_p),
+        ]
+        lib.XGetWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(_XWindowAttributes)]
+        lib.XTranslateCoordinates.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong),
+        ]
+        lib.XQueryTree.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint),
+        ]
+        lib.XFree.argtypes = [ctypes.c_void_p]
+        lib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        lib.XSetErrorHandler.restype = ctypes.c_void_p
+        lib.XSetErrorHandler.argtypes = [ctypes.c_void_p]
+        self.lib = lib
+        # A window can go away between two requests: Xlib's default handler would end the process.
+        self._handler = _X_ERROR_HANDLER(lambda _display, _event: 0)
+        self._previous = lib.XSetErrorHandler(ctypes.cast(self._handler, ctypes.c_void_p))
+        self.display = lib.XOpenDisplay(None)
+        if not self.display:
+            lib.XSetErrorHandler(self._previous)
+            raise RuntimeError("X11 display unavailable")
+        self.root = lib.XDefaultRootWindow(self.display)
+        self._atoms = {}
+
+    def close(self):
+        if self.display:
+            self.lib.XSync(self.display, 0)
+            self.lib.XCloseDisplay(self.display)
+            self.display = None
+        self.lib.XSetErrorHandler(self._previous)
+
+    def atom(self, name):
+        if name not in self._atoms:
+            self._atoms[name] = self.lib.XInternAtom(self.display, name.encode(), 1)
+        return self._atoms[name]
+
+    def prop(self, window, name):
+        """(format, values): 32-bit items as ints, 8-bit as bytes; (0, None) when absent."""
+        atom = self.atom(name)
+        if not atom:
+            return 0, None
+        actual_type, actual_format = ctypes.c_ulong(), ctypes.c_int()
+        count, after, data = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_void_p()
+        status = self.lib.XGetWindowProperty(
+            self.display, window, atom, 0, 4096, 0, 0, ctypes.byref(actual_type), ctypes.byref(actual_format),
+            ctypes.byref(count), ctypes.byref(after), ctypes.byref(data),
+        )
+        if status != 0 or not data.value:
+            return 0, None
+        try:
+            if actual_format.value == 32:
+                # Xlib hands 32-bit items to clients as C longs.
+                items = ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong))
+                return 32, [items[i] & 0xFFFFFFFF for i in range(count.value)]
+            if actual_format.value == 8:
+                return 8, ctypes.string_at(data, count.value)
+            return actual_format.value, None
+        finally:
+            self.lib.XFree(data)
+
+    def cardinal(self, window, name):
+        _, values = self.prop(window, name)
+        return values[0] if isinstance(values, list) and values else None
+
+    def text(self, window):
+        _, value = self.prop(window, "_NET_WM_NAME")
+        if not value:
+            _, value = self.prop(window, "WM_NAME")
+        return value.decode("utf-8", "replace") if isinstance(value, bytes) else ""
+
+    def attributes(self, window):
+        attrs = _XWindowAttributes()
+        if not self.lib.XGetWindowAttributes(self.display, window, ctypes.byref(attrs)):
+            return None
+        return attrs
+
+    def children(self, window):
+        root, parent = ctypes.c_ulong(), ctypes.c_ulong()
+        data, count = ctypes.c_void_p(), ctypes.c_uint()
+        if not self.lib.XQueryTree(self.display, window, ctypes.byref(root), ctypes.byref(parent),
+                                   ctypes.byref(data), ctypes.byref(count)):
+            return None, []
+        try:
+            if not data.value:
+                return parent.value, []
+            items = ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong))
+            return parent.value, [items[i] for i in range(count.value)]
+        finally:
+            if data.value:
+                self.lib.XFree(data)
+
+    def top_level(self, window):
+        """The child of the root window that holds this window (its frame, under a reparenting manager)."""
+        for _ in range(16):
+            parent, _ = self.children(window)
+            if parent is None or parent == 0:
+                return None
+            if parent == self.root:
+                return window
+            window = parent
+        return None
+
+    def entry(self, window):
+        """One window as compute_cover and match_client read it, with its frame (decorations) around it."""
+        attrs = self.attributes(window)
+        if attrs is None:
+            return None
+        x, y, child = ctypes.c_int(), ctypes.c_int(), ctypes.c_ulong()
+        self.lib.XTranslateCoordinates(self.display, window, self.root, 0, 0, ctypes.byref(x), ctypes.byref(y),
+                                       ctypes.byref(child))
+        client = frame(x.value, y.value, attrs.width, attrs.height)
+        _, extents = self.prop(window, "_NET_FRAME_EXTENTS")
+        left, right, top, bottom = (extents + [0, 0, 0, 0])[:4] if isinstance(extents, list) else (0, 0, 0, 0)
+        border = attrs.border_width
+        _, states = self.prop(window, "_NET_WM_STATE")
+        hidden_atom = self.atom("_NET_WM_STATE_HIDDEN")
+        return {
+            "id": window,
+            "client": client,
+            "rect": frame(
+                client["x"] - left - border,
+                client["y"] - top - border,
+                client["width"] + left + right + 2 * border,
+                client["height"] + top + bottom + 2 * border,
+            ),
+            "viewable": attrs.map_state == IS_VIEWABLE,
+            "input_only": attrs.window_class == INPUT_ONLY,
+            "override": bool(attrs.override_redirect),
+            "hidden": bool(hidden_atom) and isinstance(states, list) and hidden_atom in states,
+            "desktop": self.cardinal(window, "_NET_WM_DESKTOP"),
+            "pid": self.cardinal(window, "_NET_WM_PID"),
+            "name": self.text(window),
+        }
+
+    def stack(self):
+        """Top-level windows bottom to top: the manager's stacking list plus override-redirect windows."""
+        _, root_children = self.children(self.root)
+        _, managed = self.prop(self.root, "_NET_CLIENT_LIST_STACKING")
+        if not isinstance(managed, list):
+            # No window manager: the root's children are the clients, in stacking order.
+            return [entry for entry in (self.entry(w) for w in root_children) if entry is not None], root_children
+        return [entry for entry in (self.entry(w) for w in managed) if entry is not None], root_children
+
+    def override_entry(self, window):
+        """The entry of a mapped override-redirect window (a menu, a tooltip), else None."""
+        attrs = self.attributes(window)
+        if attrs is None or not attrs.override_redirect or attrs.map_state != IS_VIEWABLE or attrs.window_class == INPUT_ONLY:
+            return None
+        return self.entry(window)
+
+
+def read_window_cover(pid, title, bounds):
+    """compute_cover for an AT-SPI window, from the live X11 display; unknown when it cannot be read."""
+    if bounds is None or not os.environ.get("DISPLAY"):
+        return {"state": "unknown", "covered": []}
+    try:
+        display = X11Display()
+    except Exception:
+        return {"state": "unknown", "covered": []}
+    try:
+        stack, root_children = display.stack()
+        target = match_client(stack, pid, title, bounds)
+        if target is None:
+            return {"state": "unknown", "covered": []}
+        top = display.top_level(target)
+        if top in root_children:
+            # Menus, tooltips and other override-redirect windows above the target's frame paint over it
+            # too (without a window manager they are in the stack already).
+            known = {entry["id"] for entry in stack}
+            for window in root_children[root_children.index(top) + 1:]:
+                if window not in known:
+                    entry = display.override_entry(window)
+                    if entry is not None:
+                        stack.append(entry)
+        return compute_cover(stack, target, bounds, display.cardinal(display.root, "_NET_CURRENT_DESKTOP"))
+    except Exception:
+        return {"state": "unknown", "covered": []}
+    finally:
+        display.close()
+
+
+def black_out(pixbuf, covered):
+    """Paint the covered parts of a window picture black (they show other windows)."""
+    width, height = pixbuf.get_width(), pixbuf.get_height()
+    for rect in covered:
+        left, top = max(0, int(rect["x"])), max(0, int(rect["y"]))
+        right = min(width, int(rect["x"] + rect["width"]))
+        bottom = min(height, int(rect["y"] + rect["height"]))
+        if right > left and bottom > top:
+            pixbuf.new_subpixbuf(left, top, right - left, bottom - top).fill(0x000000FF)
+
+
+def capture_window_png(bounds, covered=()):
     if Gdk is None or bounds is None:
         return None
     try:
@@ -488,6 +803,7 @@ def capture_window_png(bounds):
             return None
         if pixbuf_looks_black(pixbuf):
             return None
+        black_out(pixbuf, covered)
         ok, data = pixbuf.save_to_bufferv("png", [], [])
         if not ok:
             return None
@@ -583,6 +899,12 @@ def build_snapshot(query, text_limit=DEFAULT_TEXT_LIMIT, max_tree_nodes=MAX_ELEM
     app, window_index, window = resolve_target(query, window_id, apps=apps)
     bounds = extents(window)
     chosen_id = window_id_of(app, window)
+    cover = {"state": "unknown", "covered": []}
+    image = None
+    if include_screenshot:
+        cover = read_window_cover(node_pid(app), node_name(window), bounds)
+        if cover["state"] not in ("full", "minimized"):
+            image = capture_window_png(bounds, cover["covered"])
     records, lines = [], []
     focus, selection = None, None
     if include_ax:
@@ -608,7 +930,8 @@ def build_snapshot(query, text_limit=DEFAULT_TEXT_LIMIT, max_tree_nodes=MAX_ELEM
         "windowBounds": bounds,
         "windowId": chosen_id,
         "otherWindows": other_windows(apps, chosen_id),
-        "screenshotPngBase64": capture_window_png(bounds) if include_screenshot else None,
+        **({"cover": cover["state"], "covered": cover["covered"]} if include_screenshot else {}),
+        "screenshotPngBase64": image,
         "treeLines": lines,
         "focusedSummary": focus,
         "selectedText": selection,
@@ -1026,6 +1349,11 @@ def perform_operation(operation):
     # pi-phone fork: only this call's own opt-out counts (exactly true), never a default.
     allow_password = operation.get("allow_password_input") is True
 
+    def physical_point(x, y):
+        # pi-phone fork: real pointer input lands on whatever is on top at that point.
+        refuse_covered_points(app, window, bounds, [(x, y)])
+        return x, y
+
     if tool == "click":
         click_method = (operation.get("click_method") or "auto").lower()
         if click_method == "accessibility":
@@ -1044,12 +1372,12 @@ def perform_operation(operation):
         elif click_method == "sky_click":
             raise RuntimeError("click_method 'sky_click' is not supported on Linux")
         elif click_method == "global":
-            x, y = screen_point(
+            x, y = physical_point(*screen_point(
                 bounds,
                 element_record,
                 operation.get("x"),
                 operation.get("y"),
-            )
+            ))
             send_mouse_click(
                 x, y, operation.get("mouse_button", "left"), operation.get("click_count", 1)
             )
@@ -1058,12 +1386,12 @@ def perform_operation(operation):
             if element is not None and operation.get("mouse_button", "left") == "left":
                 handled = do_action_by_index(element, preferred_action_index(element))
             if not handled:
-                x, y = screen_point(
+                x, y = physical_point(*screen_point(
                     bounds,
                     element_record,
                     operation.get("x"),
                     operation.get("y"),
-                )
+                ))
                 send_mouse_click(
                     x,
                     y,
@@ -1081,6 +1409,7 @@ def perform_operation(operation):
             bounds, None, operation.get("from_x"), operation.get("from_y")
         )
         to_x, to_y = screen_point(bounds, None, operation.get("to_x"), operation.get("to_y"))
+        refuse_covered_points(app, window, bounds, [(from_x, from_y), (to_x, to_y)])
         send_drag(from_x, from_y, to_x, to_y)
     elif tool == "type_text":
         if not insert_text(window, operation.get("text", ""), allow_password):
@@ -1109,6 +1438,23 @@ def perform_operation(operation):
         return {"ok": True, "snapshot": build_snapshot(operation.get("app", ""), window_id=pinned)}
     return {"ok": True, "snapshot": build_snapshot(operation.get("app", ""))}
 
+
+def refuse_covered_points(app, window, bounds, points):
+    """pi-phone fork: refuse real pointer input at points another window covers now (or a minimised window)."""
+    if bounds is None:
+        return
+    cover = read_window_cover(node_pid(app), node_name(window), bounds)
+    if cover["state"] == "minimized":
+        raise OCUError("covered", "Refused: the window is minimised; restore it and read it again.")
+    for x, y in points:
+        local_x, local_y = x - bounds["x"], y - bounds["y"]
+        for rect in cover["covered"]:
+            if rect["x"] <= local_x < rect["x"] + rect["width"] and rect["y"] <= local_y < rect["y"] + rect["height"]:
+                raise OCUError(
+                    "covered",
+                    "Refused: another window covers ({}, {}) in the window; the input would go there.".format(
+                        round(local_x), round(local_y)),
+                )
 
 
 def main():

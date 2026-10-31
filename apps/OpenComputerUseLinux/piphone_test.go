@@ -1,6 +1,6 @@
 package main
 
-// pi-phone fork (PP-270) tests: snapshot ids, stale refs, error codes.
+// pi-phone fork (PP-270) tests: snapshot ids, stale refs, covered regions, error codes.
 
 import (
 	"regexp"
@@ -66,6 +66,7 @@ func demoSnapshot() *appSnapshot {
 		WindowBounds: &frame{X: 100, Y: 100, Width: 400, Height: 300},
 		TreeLines:    []string{"\t0 frame Pi OCU Demo", "\t\t1 check box Shout Secondary Actions: click"},
 		Elements:     []elementRecord{{Index: 0, ControlType: "frame"}, {Index: 1, ControlType: "check box", Name: "Shout", ObjectPath: "/org/a11y/atspi/accessible/3"}},
+		Cover:        "clear",
 	}
 }
 
@@ -79,6 +80,8 @@ func serviceWith(responses ...*linuxResponse) (*service, *fakeBridge) {
 func TestSnapshotLinesAndStructuredResult(t *testing.T) {
 	read := demoSnapshot()
 	read.OtherWindows = []windowRef{{ID: "43:9", Title: "Other", App: "demo"}}
+	read.Cover = "partial"
+	read.Covered = []frame{{X: 300, Y: 0, Width: 100, Height: 150}}
 	s, _ := serviceWith(&linuxResponse{OK: true, Snapshot: read})
 	result := s.callTool("get_app_state", map[string]any{"app": "demo"})
 	if result.IsError {
@@ -94,6 +97,7 @@ func TestSnapshotLinesAndStructuredResult(t *testing.T) {
 	want := []string{
 		"Window id: 42:6",
 		`Other windows: 43:9 "Other" (demo)`,
+		"Covered: [{x: 300, y: 0, width: 100, height: 150}] (other windows; blacked out in the screenshot)",
 		"\t0 frame Pi OCU Demo",
 	}
 	for i, line := range want {
@@ -103,7 +107,8 @@ func TestSnapshotLinesAndStructuredResult(t *testing.T) {
 	}
 	id := strings.TrimPrefix(lines[2], "Snapshot: ")
 	structured := result.StructuredContent
-	if structured["snapshot_id"] != id || structured["window_id"] != "42:6" {
+	covered, _ := structured["covered"].([]frame)
+	if structured["snapshot_id"] != id || structured["window_id"] != "42:6" || len(covered) != 1 || covered[0].X != 300 || structured["cover"] != "partial" {
 		t.Fatalf("structured = %#v", structured)
 	}
 }
@@ -200,18 +205,76 @@ func TestRuntimeRefusalsKeepTheirCode(t *testing.T) {
 	requireCode(t, s.callTool("click", map[string]any{"app": "demo", "element_index": "1", "snapshot_id": 7}), codeInvalidArgument, "safe")
 }
 
+func TestCoordinatesInACoveredPartAreRefused(t *testing.T) {
+	read := demoSnapshot()
+	read.Cover = "partial"
+	read.Covered = []frame{{X: 300, Y: 0, Width: 100, Height: 150}}
+	s, bridge := serviceWith(&linuxResponse{OK: true, Snapshot: read})
+	s.callTool("get_app_state", map[string]any{"app": "demo"})
+	sent := len(bridge.requests)
+	requireCode(t, s.callTool("click", map[string]any{"app": "demo", "x": 350, "y": 20}), codeCovered, "safe")
+	requireCode(t, s.callTool("drag", map[string]any{"app": "demo", "from_x": 10, "from_y": 10, "to_x": 399, "to_y": 149}), codeCovered, "safe")
+	if len(bridge.requests) != sent {
+		t.Fatal("a covered point reached the runtime")
+	}
+	if result := s.callTool("click", map[string]any{"app": "demo", "x": 299, "y": 20}); result.IsError {
+		t.Fatalf("an uncovered point was refused: %#v", result)
+	}
+}
+
+func TestFullyCoveredOrMinimisedWindowsSayWhyThereIsNoScreenshot(t *testing.T) {
+	for cover, want := range map[string]string{
+		"full":      "Screenshot omitted: other windows cover the whole window.",
+		"minimized": "Screenshot omitted: the window is minimised.",
+	} {
+		read := demoSnapshot()
+		read.Cover = cover
+		if cover == "full" {
+			read.Covered = []frame{{Width: 400, Height: 300}}
+		}
+		s, _ := serviceWith(&linuxResponse{OK: true, Snapshot: read})
+		result := s.callTool("get_app_state", map[string]any{"app": "demo"})
+		if len(result.Content) != 1 || !strings.Contains(result.Content[0].Text, want) {
+			t.Fatalf("%s: %#v", cover, result)
+		}
+		requireCode(t, s.callTool("click", map[string]any{"app": "demo", "x": 5, "y": 5}), codeCovered, "safe")
+	}
+}
+
+func TestRefuseIfCovered(t *testing.T) {
+	read := demoSnapshot()
+	read.Cover = "partial"
+	read.Covered = []frame{{X: 300, Y: 0, Width: 100, Height: 150}}
+	s, _ := serviceWith(&linuxResponse{OK: true, Snapshot: read})
+	refused := s.callTool("get_app_state", map[string]any{"app": "demo", "refuse_if_covered": true})
+	requireCode(t, refused, codeCovered, "safe")
+	if len(refused.Content) != 1 || s.currentSnapshot("demo") != nil {
+		t.Fatalf("a refused read returned a picture or became the latest snapshot: %#v", refused)
+	}
+	for _, cover := range []string{"unknown", "minimized"} {
+		read.Cover = cover
+		requireCode(t, s.callTool("get_app_state", map[string]any{"app": "demo", "refuse_if_covered": true}), codeCovered, "safe")
+	}
+	read.Cover, read.Covered = "clear", nil
+	if result := s.callTool("get_app_state", map[string]any{"app": "demo", "refuse_if_covered": true}); result.IsError {
+		t.Fatalf("an uncovered window was refused: %#v", result)
+	}
+	requireCode(t, s.callTool("get_app_state", map[string]any{"app": "demo", "refuse_if_covered": true, "include_screenshot": false}), codeInvalidArgument, "safe")
+}
+
 func TestToolSchemasCarryTheForkArguments(t *testing.T) {
 	for _, tool := range toolDefinitions() {
 		properties := tool.InputSchema["properties"].(map[string]any)
 		_, snapshotID := properties["snapshot_id"]
 		_, windowID := properties["window_id"]
+		_, refuse := properties["refuse_if_covered"]
 		switch tool.Name {
 		case "list_apps":
 			if snapshotID || windowID {
 				t.Fatalf("list_apps: %#v", properties)
 			}
 		case "get_app_state":
-			if !windowID || snapshotID {
+			if !windowID || !refuse || snapshotID {
 				t.Fatalf("get_app_state: %#v", properties)
 			}
 		default:

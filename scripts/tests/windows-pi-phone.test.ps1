@@ -1,13 +1,13 @@
 param([Parameter(Mandatory = $true)][string]$RuntimePath)
 $ErrorActionPreference = "Stop"
-# pi-phone fork (PP-270): run runtime.ps1's own functions for coded errors and stale refs against
-# instrumented doubles. Runs under pwsh on Linux too; the
-# real UI Automation paths are covered by windows-pi-phone-smoke.ps1 on a Windows desktop.
+# pi-phone fork (PP-270): run runtime.ps1's own functions for coded errors, stale refs and covered
+# regions against instrumented doubles. Runs under pwsh on Linux too; the
+# real UI Automation and z-order paths are covered by windows-pi-phone-smoke.ps1 on a Windows desktop.
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($RuntimePath, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
 $names = @("New-OCUError", "New-Frame", "Limit-Text", "Test-NamesMatch", "ConvertTo-ComparableActions",
-    "Test-RecordMatches", "New-StaleElementError",
+    "Test-RecordMatches", "New-StaleElementError", "Get-UnionArea", "Get-Overlap", "Get-CoveredRegions", "Get-BlackoutRects",
     "Get-ElementTitle", "Format-ElementLine", "Find-Element", "Same-RuntimeId", "Resolve-TargetWindow",
     "Test-EnvFlagEnabled", "Assert-NotPasswordInput", "Test-ElementIsPassword")
 $functions = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names }, $true)
@@ -83,4 +83,20 @@ Assert ((Code { Resolve-TargetWindow $action $true }) -eq "stale_ref") "A window
 Assert ((Code { Resolve-TargetWindow ([pscustomobject]@{ windowHandle = 1234; app = "fixture" }) $false }) -eq "not_found") "A window of another app was read"
 Assert ($null -eq (Resolve-TargetWindow ([pscustomobject]@{ windowHandle = 0; app = "fixture" }) $true)) "No window id must keep the main window"
 
-Write-Output "pi-phone runtime functions: coded errors, stale refs and window replacement passed (instrumented doubles)."
+# Covered regions in window coordinates; full when they cover the painted frame.
+$bounds = New-Frame 100 100 400 300
+$cover = Get-CoveredRegions $bounds @((New-Frame 400 50 300 200), (New-Frame 0 0 50 50)) $bounds
+Assert ($cover.state -eq "partial" -and @($cover.covered).Count -eq 1 -and $cover.covered[0].x -eq 300 -and $cover.covered[0].height -eq 150) "Partial cover: $($cover | ConvertTo-Json -Depth 4)"
+Assert ((Get-CoveredRegions $bounds @() $bounds).state -eq "clear") "Clear"
+Assert ((Get-CoveredRegions $bounds $null $bounds).state -eq "unknown") "Unknown z-order"
+$full = Get-CoveredRegions $bounds @((New-Frame 0 0 300 800), (New-Frame 250 0 800 800)) $bounds
+Assert ($full.state -eq "full") "Full cover by two windows"
+# The invisible resize borders (outside the painted frame) need no cover for the window to be fully covered.
+$painted = New-Frame 107 100 386 293
+Assert ((Get-CoveredRegions $bounds @((New-Frame 107 100 386 293)) $painted).state -eq "full") "Full cover of the painted frame"
+Assert ((Get-UnionArea @((New-Frame 0 0 10 10), (New-Frame 5 5 10 10))) -eq 175) "Union area"
+$strips = @(Get-BlackoutRects $bounds @((New-Frame 300 0 100 150)) $painted)
+Assert ($strips.Count -eq 4 -and $strips[0].x -eq 300) "Blackout keeps the covered part first: $($strips | ConvertTo-Json -Depth 3)"
+Assert (($strips | Where-Object { $_.x -eq 0 -and $_.width -eq 7 }) -and ($strips | Where-Object { $_.x -eq 393 -and $_.width -eq 7 }) -and ($strips | Where-Object { $_.y -eq 293 -and $_.height -eq 7 })) "Invisible borders not blacked out"
+
+Write-Output "pi-phone runtime functions: coded errors, stale refs, window replacement and covered regions passed (instrumented doubles)."

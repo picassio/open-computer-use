@@ -57,7 +57,7 @@ type contentItem struct {
 type toolCallResult struct {
 	Content []contentItem `json:"content"`
 	IsError bool          `json:"isError"`
-	// pi-phone fork: snapshot_id and window_id of a read; code, retry and suggestion of an error.
+	// pi-phone fork: snapshot_id, window_id and covered of a read; code, retry and suggestion of an error.
 	StructuredContent map[string]any `json:"structuredContent,omitempty"`
 }
 
@@ -99,11 +99,13 @@ type elementRecord struct {
 }
 
 type appSnapshot struct {
-	// pi-phone fork: this read's id, its window id (the window handle) and the other windows the app
-	// matches.
+	// pi-phone fork: this read's id, its window id (the window handle), the other windows the app
+	// matches, and what covers the window (clear, partial, full, minimized, unknown; covered parts).
 	ID           string      `json:"-"`
 	WindowID     string      `json:"-"`
 	OtherWindows []windowRef `json:"otherWindows,omitempty"`
+	Cover        string      `json:"cover,omitempty"`
+	Covered      []frame     `json:"covered,omitempty"`
 
 	WindowHandle        int64           `json:"windowHandle,omitempty"`
 	ScreenshotOmitted   bool            `json:"-"`
@@ -138,6 +140,8 @@ func (s *appSnapshot) renderedText() string {
 	lines = append(lines, s.TreeLines...)
 	if s.ScreenshotOmitted {
 		lines = append(lines, "", "Screenshot omitted by include_screenshot=false")
+	} else if omission := s.coverOmission(); omission != "" {
+		lines = append(lines, "", omission)
 	} else if !s.hasUsableScreenshot() {
 		lines = append(lines, "", "Screenshot unavailable. Restore a visible, non-minimized, on-screen window before using screenshot-coordinate actions; element_index actions may still work.")
 	}
@@ -343,7 +347,15 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 		if err != nil {
 			return invalidArgument(err)
 		}
-		return s.getAppState(requiredString(args, "app"), textLimit, maxTreeNodes, maxTreeDepth, includeAX, includeScreenshot, windowHandle)
+		refuseIfCovered, err := optionalBool(args, "refuse_if_covered")
+		if err != nil {
+			return invalidArgument(err)
+		}
+		refuse := refuseIfCovered != nil && *refuseIfCovered
+		if refuse && includeScreenshot != nil && !*includeScreenshot {
+			return errorResult(codeInvalidArgument, "refuse_if_covered needs include_screenshot", "")
+		}
+		return s.getAppState(requiredString(args, "app"), textLimit, maxTreeNodes, maxTreeDepth, includeAX, includeScreenshot, windowHandle, refuse)
 	}
 
 	// pi-phone fork: every action takes snapshot_id and window_id.
@@ -438,7 +450,7 @@ func (s *service) listApps() toolCallResult {
 	return textResult(response.Text, false)
 }
 
-func (s *service) getAppState(app string, textLimit *textLimit, maxTreeNodes, maxTreeDepth *int, includeAX, includeScreenshot *bool, windowHandle int64) toolCallResult {
+func (s *service) getAppState(app string, textLimit *textLimit, maxTreeNodes, maxTreeDepth *int, includeAX, includeScreenshot *bool, windowHandle int64, refuseIfCovered bool) toolCallResult {
 	if app == "" {
 		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
@@ -452,7 +464,28 @@ func (s *service) getAppState(app string, textLimit *textLimit, maxTreeNodes, ma
 	if maxTreeDepth != nil {
 		request.MaxTreeDepth = *maxTreeDepth
 	}
-	snapshot, result := s.refreshSnapshot(app, request)
+	var snapshot *appSnapshot
+	var result toolCallResult
+	if refuseIfCovered {
+		// pi-phone fork: check before the read becomes the app's latest snapshot.
+		snapshot, result = s.refreshSnapshotIf(app, request, func(read *appSnapshot) *toolCallResult {
+			if read.Cover == "clear" {
+				return nil
+			}
+			message := "Refused (refuse_if_covered): other windows cover " + renderFrames(read.Covered) + " of the window."
+			switch read.Cover {
+			case "minimized":
+				message = "Refused (refuse_if_covered): the window is minimised."
+			case "unknown", "":
+				message = "Refused (refuse_if_covered): the window's z-order could not be read, so the window may be covered or hidden."
+			}
+			refusal := errorResult(codeCovered, message, "")
+			refusal.StructuredContent["covered"] = read.Covered
+			return &refusal
+		})
+	} else {
+		snapshot, result = s.refreshSnapshot(app, request)
+	}
 	if result.IsError {
 		return result
 	}
@@ -486,6 +519,9 @@ func (s *service) click(app, elementIndex string, x, y *float64, clickCount int,
 	}
 	if (elementIndex == "" || clickMethod == "app_post" || clickMethod == "global") && !snapshot.hasUsableScreenshot() {
 		return screenshotCoordinatesUnavailableResult(app, snapshot)
+	}
+	if elementIndex == "" && snapshot.coveredAt(*x, *y) {
+		return coveredPointResult(*x, *y)
 	}
 	request := psRequest{
 		Tool:         "click",
@@ -579,11 +615,19 @@ func (s *service) drag(app string, fromX, fromY, toX, toY *float64, options ...c
 	if !snapshot.hasUsableScreenshot() {
 		return screenshotCoordinatesUnavailableResult(app, snapshot)
 	}
+	for _, point := range [][2]float64{{*fromX, *fromY}, {*toX, *toY}} {
+		if snapshot.coveredAt(point[0], point[1]) {
+			return coveredPointResult(point[0], point[1])
+		}
+	}
 	return s.actionResult(app, pinned(psRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, WindowBounds: snapshot.WindowBounds}, snapshot, opts))
 }
 
 func screenshotCoordinatesUnavailableResult(app string, snapshot *appSnapshot) toolCallResult {
 	message := "No usable screenshot is available for " + app + ". Run get_app_state with include_screenshot=true on a visible, non-minimized, on-screen window before using screenshot coordinates."
+	if snapshot != nil && (snapshot.Cover == "full" || snapshot.Cover == "minimized") {
+		return errorResult(codeCovered, message, "")
+	}
 	return errorResult(codeStaleRef, message, "Call get_app_state with a screenshot of a visible window first.")
 }
 
@@ -675,6 +719,12 @@ func (s *service) currentSnapshot(app string) *appSnapshot {
 }
 
 func (s *service) refreshSnapshot(app string, request psRequest) (*appSnapshot, toolCallResult) {
+	return s.refreshSnapshotIf(app, request, nil)
+}
+
+// refreshSnapshotIf reads (or acts and reads back) and keeps the read as the app's latest snapshot,
+// unless check refuses it first (refuse_if_covered).
+func (s *service) refreshSnapshotIf(app string, request psRequest, check func(*appSnapshot) *toolCallResult) (*appSnapshot, toolCallResult) {
 	action := request.Tool != "get_app_state"
 	response, err := s.runBridge(request)
 	if err != nil {
@@ -687,6 +737,11 @@ func (s *service) refreshSnapshot(app string, request psRequest) (*appSnapshot, 
 		return nil, bridgeFailure("Windows runtime did not return an app snapshot.", "", "", action)
 	}
 	response.Snapshot.WindowID = windowIDOf(response.Snapshot.WindowHandle)
+	if check != nil {
+		if refusal := check(response.Snapshot); refusal != nil {
+			return nil, *refusal
+		}
+	}
 	if request.IncludeScreenshot != nil && !*request.IncludeScreenshot {
 		response.Snapshot.ScreenshotPNGBase64 = ""
 		response.Snapshot.ScreenshotOmitted = true
