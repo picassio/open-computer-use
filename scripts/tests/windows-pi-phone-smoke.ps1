@@ -13,17 +13,61 @@ if ($env:OS -ne "Windows_NT") { throw "Windows desktop required" }
 Add-Type -AssemblyName System.Drawing
 Add-Type -TypeDefinition @"
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text;
 public static class PiPhoneSmokeWin32 {
+    delegate bool EnumProc(IntPtr hWnd, IntPtr unused);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc callback, IntPtr unused);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, StringBuilder text, int count);
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hWnd, int index);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    // The visible top-level windows above a window, from the top: what may cover it.
+    public static string WindowsAbove(long handle) {
+        List<string> above = new List<string>();
+        EnumWindows(delegate (IntPtr hWnd, IntPtr unused) {
+            if (hWnd.ToInt64() == handle) return false;
+            if (!IsWindowVisible(hWnd)) return true;
+            StringBuilder title = new StringBuilder(256), name = new StringBuilder(256);
+            GetWindowText(hWnd, title, title.Capacity);
+            GetClassName(hWnd, name, name.Capacity);
+            uint processId;
+            GetWindowThreadProcessId(hWnd, out processId);
+            int[] frame = Frame(hWnd.ToInt64());
+            above.Add(name + " '" + title + "' pid=" + processId + " exstyle=0x" + GetWindowLong(hWnd, -20).ToString("x") +
+                (frame == null ? "" : " frame=" + string.Join(",", frame)));
+            return true;
+        }, IntPtr.Zero);
+        return string.Join(" | ", above.ToArray());
+    }
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
-    public static string Describe(long handle) {
-        IntPtr hWnd = new IntPtr(handle);
+    [DllImport("user32.dll")] private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr hWnd, int attribute, out RECT value, int size);
+    // Physical pixels, as ocu's runtime (per-monitor aware) reports them.
+    static void Physical() { SetThreadDpiAwarenessContext(new IntPtr(-4)); }
+    // The window rectangle (what ocu captures) and DWM's painted frame, as {x, y, width, height} strings.
+    public static int[] Rect(long handle) {
+        Physical();
         RECT rect;
-        bool known = GetWindowRect(hWnd, out rect);
-        return "window " + handle + " visible=" + IsWindowVisible(hWnd) + (known ? " rect=" + rect.Left + "," + rect.Top + "," + rect.Right + "," + rect.Bottom : " rect=unknown");
+        if (!GetWindowRect(new IntPtr(handle), out rect)) return null;
+        return new int[] { rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top };
+    }
+    public static int[] Frame(long handle) {
+        Physical();
+        RECT rect;
+        if (DwmGetWindowAttribute(new IntPtr(handle), 9, out rect, Marshal.SizeOf(typeof(RECT))) != 0) return null;
+        return new int[] { rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top };
+    }
+    public static string Describe(long handle) {
+        int[] rect = Rect(handle);
+        int[] frame = Frame(handle);
+        return "window " + handle + " visible=" + IsWindowVisible(new IntPtr(handle)) +
+            (rect == null ? " rect=unknown" : " rect=" + string.Join(",", rect)) +
+            (frame == null ? " frame=unknown" : " frame=" + string.Join(",", frame));
     }
 }
 "@
@@ -97,7 +141,7 @@ function Start-Cover($left, $top, $width, $height) {
     $coverState = Join-Path $directory "$name.json"
     $coverError = Join-Path $directory "$name.err"
     $script:cover = Start-Process powershell.exe -ArgumentList @("-NoProfile", "-STA", "-File", "`"$fixtureSource`"", "-StatePath", "`"$coverState`"", "-Cover",
-        "-Left", $left, "-Top", $top, "-Width", $width, "-Height", $height) -PassThru -RedirectStandardOutput (Join-Path $directory "$name.out") -RedirectStandardError $coverError
+        "-Left", $left, "-Top", $top, "-Width", $width, "-Height", $height) -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $directory "$name.out") -RedirectStandardError $coverError
     try {
         Wait-For { $script:cover.HasExited -or ((Test-Path -LiteralPath $coverState) -and (Read-WindowsFixtureState $coverState).ready) } "cover window"
     } catch {
@@ -121,6 +165,38 @@ function Read-Until($pattern, $arguments = @{}) {
 function Describe-Windows {
     "cover " + [PiPhoneSmokeWin32]::Describe($script:coverHandle) + "; fixture " + [PiPhoneSmokeWin32]::Describe([long](Get-Process -Id $fixture.Id).MainWindowHandle)
 }
+# The rectangles of a read's Covered: line, in window (screenshot) coordinates.
+function Covered-Rects($result) {
+    $line = [regex]::Match((Text $result), "(?m)^Covered: \[(.*?)\]").Groups[1].Value
+    @([regex]::Matches($line, "\{x: (-?\d+), y: (-?\d+), width: (\d+), height: (\d+)\}") | ForEach-Object {
+        [pscustomobject]@{ x = [int]$_.Groups[1].Value; y = [int]$_.Groups[2].Value; width = [int]$_.Groups[3].Value; height = [int]$_.Groups[4].Value }
+    })
+}
+function In-Rect($rect, $px, $py, $margin = 0) {
+    $px -ge ($rect.x - $margin) -and $px -lt ($rect.x + $rect.width + $margin) -and $py -ge ($rect.y - $margin) -and $py -lt ($rect.y + $rect.height + $margin)
+}
+function Is-Black($pixel) { $pixel.R -eq 0 -and $pixel.G -eq 0 -and $pixel.B -eq 0 }
+function Is-Red($pixel) { $pixel.R -gt 200 -and $pixel.G -lt 60 -and $pixel.B -lt 60 }
+# Pixels on a 6-pixel grid: inside the given rectangle, or (rect $null) in the window's painted frame
+# but at least 8 pixels away from every covered rectangle.
+function Sample-Pixels($bitmap, $rect, $covered, $painted) {
+    $samples = New-Object System.Collections.Generic.List[object]
+    for ($py = 0; $py -lt $bitmap.Height; $py += 6) {
+        for ($px = 0; $px -lt $bitmap.Width; $px += 6) {
+            if ($null -ne $rect) {
+                if (-not (In-Rect $rect $px $py)) { continue }
+            } else {
+                if (-not (In-Rect $painted $px $py -8)) { continue }
+                if (@($covered | Where-Object { In-Rect $_ $px $py 8 }).Count -gt 0) { continue }
+            }
+            $samples.Add([pscustomobject]@{ x = $px; y = $py; pixel = $bitmap.GetPixel($px, $py) })
+        }
+    }
+    return $samples.ToArray()
+}
+function Show-Samples($samples, [int]$count = 6) {
+    (@($samples | Select-Object -First $count | ForEach-Object { "($($_.x),$($_.y))=#{0:x2}{1:x2}{2:x2}" -f $_.pixel.R, $_.pixel.G, $_.pixel.B }) -join " ")
+}
 function Get-Pixels($result) {
     $image = Image $result
     Assert ($null -ne $image) ("No screenshot:`n" + (Text $result))
@@ -128,7 +204,9 @@ function Get-Pixels($result) {
     return New-Object System.Drawing.Bitmap $stream
 }
 try {
-    $fixture = Start-Process powershell.exe -ArgumentList @("-NoProfile", "-STA", "-File", "`"$fixtureSource`"", "-StatePath", "`"$stateFile`"") -PassThru -RedirectStandardOutput (Join-Path $directory "fixture.out") -RedirectStandardError (Join-Path $directory "fixture.err")
+    # -NoNewWindow: Start-Process otherwise opens a console window for each powershell.exe, on top of
+    # the windows already there; the cover fixture's console then covers part of this fixture too.
+    $fixture = Start-Process powershell.exe -ArgumentList @("-NoProfile", "-STA", "-File", "`"$fixtureSource`"", "-StatePath", "`"$stateFile`"") -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $directory "fixture.out") -RedirectStandardError (Join-Path $directory "fixture.err")
     Wait-For { Test-Path -LiteralPath $stateFile } "WPF startup"
     Wait-For { (Get-Process -Id $fixture.Id).MainWindowHandle -ne [IntPtr]::Zero } "visible WPF main window"
     $start = New-Object System.Diagnostics.ProcessStartInfo
@@ -151,6 +229,16 @@ try {
     Assert ((Text $state) -match "(?m)^Window id: \d+$") ("No Window id: line:`n" + (Text $state))
     Assert ((Text $state) -notmatch "(?m)^Covered:") ("The uncovered fixture was reported covered:`n" + (Text $state))
     Assert ($null -ne (Image $state)) "No screenshot of the uncovered fixture"
+    $fixtureHandle = [long](Get-Process -Id $fixture.Id).MainWindowHandle
+    $bitmap = Get-Pixels $state
+    try {
+        $all = @(Sample-Pixels $bitmap ([pscustomobject]@{ x = 0; y = 0; width = $bitmap.Width; height = $bitmap.Height }) @() $null)
+        $black = @($all | Where-Object { Is-Black $_.pixel }).Count
+        Write-Output ("Uncovered screenshot {0}x{1} of fixture {2}: {3} of {4} samples pure black; {5}" -f $bitmap.Width, $bitmap.Height, [PiPhoneSmokeWin32]::Describe($fixtureHandle), $black, $all.Count, (Show-Samples ($all | Select-Object -Skip ([int]($all.Count / 2)))))
+        Write-Output ("Visible windows above the fixture: " + [PiPhoneSmokeWin32]::WindowsAbove($fixtureHandle))
+        # A capture that is mostly black is no picture of the window at all (a locked or disconnected desktop).
+        Assert ($black -lt $all.Count / 2) "The uncovered fixture's screenshot is mostly black: the capture itself does not work here"
+    } finally { $bitmap.Dispose() }
     Write-Output "Reads carry Snapshot: and Window id:; the uncovered fixture has no Covered: line."
 
     # Check box state.
@@ -206,25 +294,41 @@ try {
     Start-Cover 380 180 250 150
     $covered = Read-Until "(?m)^Covered: \["
     Assert (-not $covered.isError) (Text $covered)
-    $match = [regex]::Match((Text $covered), "(?m)^Covered: \[\{x: (\d+), y: (\d+), width: (\d+), height: (\d+)\}")
-    Assert $match.Success ("No Covered: line with the cover window over the fixture ($(Describe-Windows)):`n" + (Text $covered))
-    $x, $y, $width, $height = 1..4 | ForEach-Object { [int]$match.Groups[$_].Value }
+    $rects = @(Covered-Rects $covered)
+    Assert ($rects.Count -gt 0) ("No Covered: line with the cover window over the fixture ($(Describe-Windows)):`n" + (Text $covered))
+    $fixtureRect = [PiPhoneSmokeWin32]::Rect($fixtureHandle)
+    $fixtureFrame = [PiPhoneSmokeWin32]::Frame($fixtureHandle)
+    $coverFrame = [PiPhoneSmokeWin32]::Frame($script:coverHandle)
+    # Where the cover window paints, in the fixture's screenshot coordinates (its origin is the window rectangle).
+    $expected = [pscustomobject]@{ x = $coverFrame[0] - $fixtureRect[0]; y = $coverFrame[1] - $fixtureRect[1]; width = $coverFrame[2]; height = $coverFrame[3] }
+    $painted = [pscustomobject]@{ x = $fixtureFrame[0] - $fixtureRect[0]; y = $fixtureFrame[1] - $fixtureRect[1]; width = $fixtureFrame[2]; height = $fixtureFrame[3] }
     $bitmap = Get-Pixels $covered
     try {
-        $inside = $bitmap.GetPixel($x + [int]($width / 2), $y + [int]($height / 2))
-        Assert ($inside.R -eq 0 -and $inside.G -eq 0 -and $inside.B -eq 0) "The covered part is not black: $inside"
-        $red = 0
-        for ($py = 0; $py -lt $bitmap.Height; $py += 4) {
-            for ($px = 0; $px -lt $bitmap.Width; $px += 4) {
-                $pixel = $bitmap.GetPixel($px, $py)
-                if ($pixel.R -gt 200 -and $pixel.G -lt 60 -and $pixel.B -lt 60) { $red += 1 }
-            }
-        }
+        Write-Output ("{0} | image {1}x{2}; {3}; cover expected at {4},{5} {6}x{7}; painted frame at {8},{9} {10}x{11}" -f
+            ([regex]::Match((Text $covered), "(?m)^Covered: .*$").Value), $bitmap.Width, $bitmap.Height, (Describe-Windows),
+            $expected.x, $expected.y, $expected.width, $expected.height, $painted.x, $painted.y, $painted.width, $painted.height)
+        Write-Output ("Visible windows above the fixture: " + [PiPhoneSmokeWin32]::WindowsAbove($fixtureHandle))
+        Assert ($bitmap.Width -eq $fixtureRect[2] -and $bitmap.Height -eq $fixtureRect[3]) "The screenshot is not the window rectangle's size"
+        # The cover window's part is reported where it really is, and nothing reported spans the whole window.
+        $coverPart = @($rects | Where-Object { [math]::Abs($_.x - $expected.x) -le 1 -and [math]::Abs($_.y - $expected.y) -le 1 -and
+            ([math]::Abs($_.width - $expected.width) -le 1 -or $_.x + $_.width -ge $bitmap.Width - 1) -and
+            ([math]::Abs($_.height - $expected.height) -le 1 -or $_.y + $_.height -ge $bitmap.Height - 1) }) | Select-Object -First 1
+        Assert ($null -ne $coverPart) "No reported rectangle is where the cover window paints"
+        Assert (@($rects | Where-Object { $_.width -ge $painted.width -and $_.height -ge $painted.height }).Count -eq 0) "A reported rectangle spans the whole window"
+        $inside = @(Sample-Pixels $bitmap $coverPart $rects $painted)
+        $insideBlack = @($inside | Where-Object { Is-Black $_.pixel }).Count
+        $outside = @(Sample-Pixels $bitmap $null $rects $painted)
+        $outsideBlack = @($outside | Where-Object { Is-Black $_.pixel }).Count
+        $red = @(Sample-Pixels $bitmap ([pscustomobject]@{ x = 0; y = 0; width = $bitmap.Width; height = $bitmap.Height }) @() $null | Where-Object { Is-Red $_.pixel }).Count
+        Write-Output ("Inside the cover: {0} of {1} samples pure black ({2}). Outside every covered part: {3} of {4} pure black ({5}). Red samples: {6}." -f
+            $insideBlack, $inside.Count, (Show-Samples $inside 3), $outsideBlack, $outside.Count, (Show-Samples ($outside | Select-Object -Skip ([int]($outside.Count / 2)))), $red)
+        Assert ($inside.Count -gt 0 -and $insideBlack -eq $inside.Count) "The covered part is not black"
         Assert ($red -eq 0) "The cover window's red shows in the fixture's screenshot ($red samples)"
-        $outside = $bitmap.GetPixel([math]::Max(30, $x - 60), [math]::Min($bitmap.Height - 20, $y + 20))
-        Assert (-not ($outside.R -eq 0 -and $outside.G -eq 0 -and $outside.B -eq 0)) "The uncovered part is black too"
+        # The fixture's uncovered part is its light WPF surface; dark text is a small share of it.
+        Assert ($outside.Count -ge 50 -and $outsideBlack -lt $outside.Count / 5) "The uncovered part is black too"
+        $x, $y = $coverPart.x, $coverPart.y
     } finally { $bitmap.Dispose() }
-    Write-Output "Covered part $x,$y ${width}x$height is reported and black; no cover pixels in the screenshot."
+    Write-Output "Covered part $($coverPart.x),$($coverPart.y) $($coverPart.width)x$($coverPart.height) is reported and black; the rest is not; no cover pixels in the screenshot."
     Assert-Code (Call-Tool "get_app_state" @{ refuse_if_covered = $true }) "covered" "refuse_if_covered"
     Assert-Code (Call-Tool "click" @{ x = ($x + 10); y = ($y + 10); headed = $true }) "covered" "A click in the covered part"
     Write-Output "refuse_if_covered and a click in the covered part are refused with covered."
