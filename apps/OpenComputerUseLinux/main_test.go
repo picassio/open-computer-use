@@ -295,12 +295,12 @@ func TestLinuxClickMethodSafetyAndPlatformSupport(t *testing.T) {
 	service := newService()
 
 	result := service.click("Text Editor", "", &x, &y, 1, "left", "app_post")
-	if !result.IsError || result.Content[0].Text != "click_method 'app_post' is not supported on Linux" {
+	if !result.IsError || firstLine(result) != "click_method 'app_post' is not supported on Linux" {
 		t.Fatalf("app_post click result = %#v", result)
 	}
 
 	result = service.click("Text Editor", "", &x, &y, 1, "left", "sky_click")
-	if !result.IsError || result.Content[0].Text != "click_method 'sky_click' is not supported on Linux" {
+	if !result.IsError || firstLine(result) != "click_method 'sky_click' is not supported on Linux" {
 		t.Fatalf("sky_click result = %#v", result)
 	}
 
@@ -699,11 +699,11 @@ func TestLinuxKeyMethodSchemaAndUnsupportedSkyKey(t *testing.T) {
 
 	service := newService()
 	result := service.typeText("Text Editor", "hello", "sky_key", false)
-	if !result.IsError || result.Content[0].Text != "key_method 'sky_key' is not supported on Linux" {
+	if !result.IsError || firstLine(result) != "key_method 'sky_key' is not supported on Linux" {
 		t.Fatalf("type_text sky_key result = %#v", result)
 	}
 	result = service.pressKey("Text Editor", "Return", "sky_key", false)
-	if !result.IsError || result.Content[0].Text != "key_method 'sky_key' is not supported on Linux" {
+	if !result.IsError || firstLine(result) != "key_method 'sky_key' is not supported on Linux" {
 		t.Fatalf("press_key sky_key result = %#v", result)
 	}
 }
@@ -722,7 +722,7 @@ func TestLinuxWindowPlacementSchemaAndUnsupportedAgentDisplay(t *testing.T) {
 		t.Fatal("parseWindowPlacement(park) should fail")
 	}
 	result := newService().callTool("get_app_state", map[string]any{"app": "Text Editor", "window_placement": "agent_display"})
-	if !result.IsError || result.Content[0].Text != "window_placement 'agent_display' is not supported on Linux" {
+	if !result.IsError || firstLine(result) != "window_placement 'agent_display' is not supported on Linux" {
 		t.Fatalf("agent_display result = %#v", result)
 	}
 }

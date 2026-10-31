@@ -5,7 +5,7 @@ $ErrorActionPreference = "Stop"
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($RuntimePath, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
-$names = @("Test-EnvFlagEnabled", "Test-GlobalPointerFallbackEnabled", "Assert-GlobalInputTarget", "Assert-CurrentWindowBounds", "Assert-GlobalPointerTarget", "Send-GlobalMouseMove", "Send-GlobalMouseClick", "Send-Drag", "Send-Scroll", "Send-Key", "Get-VirtualKey", "ConvertTo-LParam", "ConvertTo-WheelWParam", "Resolve-GlobalElementPoint", "Same-RuntimeId", "Get-ScreenPoint")
+$names = @("New-OCUError", "Test-EnvFlagEnabled", "Test-GlobalPointerFallbackEnabled", "Assert-GlobalInputTarget", "Assert-CurrentWindowBounds", "Assert-GlobalPointerTarget", "Send-GlobalMouseMove", "Send-GlobalMouseClick", "Send-Drag", "Send-Scroll", "Send-Key", "Get-VirtualKey", "ConvertTo-LParam", "ConvertTo-WheelWParam", "Resolve-GlobalElementPoint", "Same-RuntimeId", "Get-ScreenPoint")
 $functions = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names }, $true)
 if ($functions.Count -ne $names.Count) { throw "Production input functions missing" }
 foreach ($function in $functions) { Invoke-Expression $function.Extent.Text }

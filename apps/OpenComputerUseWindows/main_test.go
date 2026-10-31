@@ -96,7 +96,7 @@ func TestScrollRequestIncludesWindowBounds(t *testing.T) {
 func TestWindowsRejectsUnsupportedSkyClickBeforeSnapshotLookup(t *testing.T) {
 	x, y := 10.0, 20.0
 	result := newService().click("Notepad", "", &x, &y, 1, "left", "sky_click")
-	if !result.IsError || result.Content[0].Text != "click_method 'sky_click' is not supported on Windows" {
+	if !result.IsError || firstLine(result) != "click_method 'sky_click' is not supported on Windows" {
 		t.Fatalf("sky_click result = %#v", result)
 	}
 }
@@ -468,11 +468,11 @@ func TestWindowsKeyMethodSchemaAndUnsupportedSkyKey(t *testing.T) {
 
 	service := newService()
 	result := service.typeText("Notepad", "hello", "sky_key", false)
-	if !result.IsError || result.Content[0].Text != "key_method 'sky_key' is not supported on Windows" {
+	if !result.IsError || firstLine(result) != "key_method 'sky_key' is not supported on Windows" {
 		t.Fatalf("type_text sky_key result = %#v", result)
 	}
 	result = service.pressKey("Notepad", "Return", "sky_key", false)
-	if !result.IsError || result.Content[0].Text != "key_method 'sky_key' is not supported on Windows" {
+	if !result.IsError || firstLine(result) != "key_method 'sky_key' is not supported on Windows" {
 		t.Fatalf("press_key sky_key result = %#v", result)
 	}
 }
@@ -491,7 +491,7 @@ func TestWindowsWindowPlacementSchemaAndUnsupportedAgentDisplay(t *testing.T) {
 		t.Fatal("parseWindowPlacement(park) should fail")
 	}
 	result := newService().callTool("get_app_state", map[string]any{"app": "Notepad", "window_placement": "agent_display"})
-	if !result.IsError || result.Content[0].Text != "window_placement 'agent_display' is not supported on Windows" {
+	if !result.IsError || firstLine(result) != "window_placement 'agent_display' is not supported on Windows" {
 		t.Fatalf("agent_display result = %#v", result)
 	}
 }

@@ -50,6 +50,8 @@ type contentItem struct {
 type toolCallResult struct {
 	Content []contentItem `json:"content"`
 	IsError bool          `json:"isError"`
+	// pi-phone fork: code, retry and suggestion of an error.
+	StructuredContent map[string]any `json:"structuredContent,omitempty"`
 }
 
 func textResult(text string, isError bool) toolCallResult {
@@ -194,14 +196,18 @@ type linuxResponse struct {
 	Text     string       `json:"text,omitempty"`
 	Error    string       `json:"error,omitempty"`
 	Snapshot *appSnapshot `json:"snapshot,omitempty"`
+	// pi-phone fork: a refusal's code (stale_ref, covered, password_field, ...) and suggestion.
+	Code       string `json:"code,omitempty"`
+	Suggestion string `json:"suggestion,omitempty"`
 }
 
 type service struct {
 	snapshots map[string]*appSnapshot
+	runBridge func(linuxRequest) (*linuxResponse, error)
 }
 
 func newService() *service {
-	return &service{snapshots: map[string]*appSnapshot{}}
+	return &service{snapshots: map[string]*appSnapshot{}, runBridge: runPython}
 }
 
 func (s *service) callTool(name string, args map[string]any) toolCallResult {
@@ -211,39 +217,39 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 	case "get_app_state":
 		maxTreeNodes, err := optionalPositiveInt(args, "max_tree_nodes")
 		if err != nil {
-			return textResult(err.Error(), true)
+			return invalidArgument(err)
 		}
 		maxTreeDepth, err := optionalPositiveInt(args, "max_tree_depth")
 		if err != nil {
-			return textResult(err.Error(), true)
+			return invalidArgument(err)
 		}
 		textLimit, err := optionalTextLimit(args, "text_limit")
 		if err != nil {
-			return textResult(err.Error(), true)
+			return invalidArgument(err)
 		}
 		windowPlacement, err := parseWindowPlacement(optionalString(args, "window_placement"))
 		if err != nil {
-			return textResult(err.Error(), true)
+			return invalidArgument(err)
 		}
 		if windowPlacement != "keep" {
-			return textResult("window_placement '"+windowPlacement+"' is not supported on Linux", true)
+			return errorResult(codeInvalidArgument, "window_placement '"+windowPlacement+"' is not supported on Linux", "")
 		}
 		includeAX, err := optionalBool(args, "include_ax")
 		if err != nil {
-			return textResult(err.Error(), true)
+			return invalidArgument(err)
 		}
 		includeScreenshot, err := optionalBool(args, "include_screenshot")
 		if err != nil {
-			return textResult(err.Error(), true)
+			return invalidArgument(err)
 		}
 		if includeAX != nil && !*includeAX && includeScreenshot != nil && !*includeScreenshot {
-			return textResult("At least one of include_ax or include_screenshot must be true", true)
+			return errorResult(codeInvalidArgument, "At least one of include_ax or include_screenshot must be true", "")
 		}
 		return s.getAppState(requiredString(args, "app"), textLimit, maxTreeNodes, maxTreeDepth, includeAX, includeScreenshot)
 	case "click":
 		clickMethod, err := parseClickMethod(optionalString(args, "click_method"))
 		if err != nil {
-			return textResult(err.Error(), true)
+			return invalidArgument(err)
 		}
 		return s.click(
 			requiredString(args, "app"),
@@ -278,41 +284,41 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 	case "type_text":
 		keyMethod, err := parseKeyMethod(optionalString(args, "key_method"))
 		if err != nil {
-			return textResult(err.Error(), true)
+			return invalidArgument(err)
 		}
 		allowPassword, err := allowPasswordInput(args)
 		if err != nil {
-			return textResult(err.Error(), true)
+			return invalidArgument(err)
 		}
 		return s.typeText(requiredString(args, "app"), requiredString(args, "text"), keyMethod, allowPassword)
 	case "press_key":
 		keyMethod, err := parseKeyMethod(optionalString(args, "key_method"))
 		if err != nil {
-			return textResult(err.Error(), true)
+			return invalidArgument(err)
 		}
 		allowPassword, err := allowPasswordInput(args)
 		if err != nil {
-			return textResult(err.Error(), true)
+			return invalidArgument(err)
 		}
 		return s.pressKey(requiredString(args, "app"), requiredString(args, "key"), keyMethod, allowPassword)
 	case "set_value":
 		allowPassword, err := allowPasswordInput(args)
 		if err != nil {
-			return textResult(err.Error(), true)
+			return invalidArgument(err)
 		}
 		return s.setValue(requiredString(args, "app"), requiredElementIndex(args), requiredString(args, "value"), allowPassword)
 	default:
-		return textResult(fmt.Sprintf("unsupportedTool(%q)", name), true)
+		return errorResult(codeInvalidArgument, fmt.Sprintf("unsupportedTool(%q)", name), "")
 	}
 }
 
 func (s *service) listApps() toolCallResult {
-	response, err := runPython(linuxRequest{Tool: "list_apps"})
+	response, err := s.runBridge(linuxRequest{Tool: "list_apps"})
 	if err != nil {
-		return textResult(err.Error(), true)
+		return bridgeFailure(err.Error(), "", "", false)
 	}
 	if !response.OK {
-		return textResult(response.Error, true)
+		return bridgeFailure(response.Error, response.Code, response.Suggestion, false)
 	}
 	if strings.TrimSpace(response.Text) == "" {
 		response.Text = "No running top-level apps are visible to this Linux runtime."
@@ -322,7 +328,7 @@ func (s *service) listApps() toolCallResult {
 
 func (s *service) getAppState(app string, textLimit *textLimit, maxTreeNodes, maxTreeDepth *int, includeAX, includeScreenshot *bool) toolCallResult {
 	if app == "" {
-		return textResult("Missing required argument: app", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
 	request := linuxRequest{Tool: "get_app_state", App: app, IncludeAX: includeAX, IncludeScreenshot: includeScreenshot}
 	if textLimit != nil {
@@ -347,29 +353,29 @@ func (s *service) getAppState(app string, textLimit *textLimit, maxTreeNodes, ma
 
 func (s *service) click(app, elementIndex string, x, y *float64, clickCount int, mouseButton, clickMethod string) toolCallResult {
 	if app == "" {
-		return textResult("Missing required argument: app", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
 	if elementIndex == "" && (x == nil || y == nil) {
-		return textResult("click requires either element_index or x/y", true)
+		return errorResult(codeInvalidArgument, "click requires either element_index or x/y", "")
 	}
 	if clickMethod == "accessibility" && elementIndex == "" {
-		return textResult("click_method 'accessibility' requires element_index", true)
+		return errorResult(codeInvalidArgument, "click_method 'accessibility' requires element_index", "")
 	}
 	if clickMethod == "app_post" {
-		return textResult("click_method 'app_post' is not supported on Linux", true)
+		return errorResult(codeInvalidArgument, "click_method 'app_post' is not supported on Linux", "")
 	}
 	if clickMethod == "sky_click" {
-		return textResult("click_method 'sky_click' is not supported on Linux", true)
+		return errorResult(codeInvalidArgument, "click_method 'sky_click' is not supported on Linux", "")
 	}
 	if clickMethod == "global" && !globalPointerFallbacksEnabled() {
-		return textResult("click_method 'global' requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 because it may move the system pointer and change foreground focus", true)
+		return errorResult(codePolicyDenied, "click_method 'global' requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 because it may move the system pointer and change foreground focus", "")
 	}
 	snapshot := s.currentSnapshot(app)
 	if snapshot == nil {
-		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+		return noAppStateResult(app)
 	}
 	if elementIndex == "" && snapshot.ScreenshotOmitted {
-		return textResult("Screenshot omitted by include_screenshot=false; request a screenshot before screenshot-coordinate actions.", true)
+		return errorResult(codeStaleRef, "Screenshot omitted by include_screenshot=false; request a screenshot before screenshot-coordinate actions.", "Call get_app_state with a screenshot first.")
 	}
 	request := linuxRequest{
 		Tool:         "click",
@@ -384,7 +390,7 @@ func (s *service) click(app, elementIndex string, x, y *float64, clickCount int,
 	if elementIndex != "" {
 		record, err := lookupElement(snapshot, elementIndex)
 		if err != nil {
-			return textResult(err.Error(), true)
+			return unknownElementResult(err)
 		}
 		request.Element = record
 	}
@@ -393,135 +399,139 @@ func (s *service) click(app, elementIndex string, x, y *float64, clickCount int,
 
 func (s *service) performSecondaryAction(app, elementIndex, action string) toolCallResult {
 	if app == "" {
-		return textResult("Missing required argument: app", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
 	if elementIndex == "" {
-		return textResult("Missing required argument: element_index", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: element_index", "")
 	}
 	if action == "" {
-		return textResult("Missing required argument: action", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: action", "")
 	}
 	snapshot := s.currentSnapshot(app)
 	if snapshot == nil {
-		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+		return noAppStateResult(app)
 	}
 	record, err := lookupElement(snapshot, elementIndex)
 	if err != nil {
-		return textResult(err.Error(), true)
+		return unknownElementResult(err)
 	}
 	return s.actionResult(app, linuxRequest{Tool: "perform_secondary_action", App: app, Element: record, Action: action})
 }
 
 func (s *service) scroll(app, direction, elementIndex string, pages float64) toolCallResult {
 	if app == "" {
-		return textResult("Missing required argument: app", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
 	if elementIndex == "" {
-		return textResult("Missing required argument: element_index", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: element_index", "")
 	}
 	normalized := strings.ToLower(direction)
 	if normalized != "up" && normalized != "down" && normalized != "left" && normalized != "right" {
-		return textResult("Invalid scroll direction: "+direction, true)
+		return errorResult(codeInvalidArgument, "Invalid scroll direction: "+direction, "")
 	}
 	if pages <= 0 {
-		return textResult("pages must be > 0", true)
+		return errorResult(codeInvalidArgument, "pages must be > 0", "")
 	}
 	snapshot := s.currentSnapshot(app)
 	if snapshot == nil {
-		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+		return noAppStateResult(app)
 	}
 	record, err := lookupElement(snapshot, elementIndex)
 	if err != nil {
-		return textResult(err.Error(), true)
+		return unknownElementResult(err)
 	}
 	return s.actionResult(app, linuxRequest{Tool: "scroll", App: app, Element: record, Direction: normalized, Pages: pages})
 }
 
 func (s *service) drag(app string, fromX, fromY, toX, toY *float64) toolCallResult {
 	if app == "" {
-		return textResult("Missing required argument: app", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
 	if fromX == nil {
-		return textResult("Missing required argument: from_x", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: from_x", "")
 	}
 	if fromY == nil {
-		return textResult("Missing required argument: from_y", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: from_y", "")
 	}
 	if toX == nil {
-		return textResult("Missing required argument: to_x", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: to_x", "")
 	}
 	if toY == nil {
-		return textResult("Missing required argument: to_y", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: to_y", "")
 	}
 	snapshot := s.currentSnapshot(app)
 	if snapshot == nil {
-		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+		return noAppStateResult(app)
 	}
 	if snapshot.ScreenshotOmitted {
-		return textResult("Screenshot omitted by include_screenshot=false; request a screenshot before screenshot-coordinate actions.", true)
+		return errorResult(codeStaleRef, "Screenshot omitted by include_screenshot=false; request a screenshot before screenshot-coordinate actions.", "Call get_app_state with a screenshot first.")
 	}
 	return s.actionResult(app, linuxRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, WindowBounds: snapshot.WindowBounds})
 }
 
 func (s *service) typeText(app, text, keyMethod string, allowPassword bool) toolCallResult {
 	if app == "" {
-		return textResult("Missing required argument: app", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
 	if text == "" {
-		return textResult("Missing required argument: text", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: text", "")
 	}
 	if keyMethod == "sky_key" {
-		return textResult("key_method 'sky_key' is not supported on Linux", true)
+		return errorResult(codeInvalidArgument, "key_method 'sky_key' is not supported on Linux", "")
 	}
 	if s.currentSnapshot(app) == nil {
-		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+		return noAppStateResult(app)
 	}
 	return s.actionResult(app, linuxRequest{Tool: "type_text", App: app, Text: text, AllowPasswordInput: allowPassword})
 }
 
 func (s *service) pressKey(app, key, keyMethod string, allowPassword bool) toolCallResult {
 	if app == "" {
-		return textResult("Missing required argument: app", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
 	if key == "" {
-		return textResult("Missing required argument: key", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: key", "")
 	}
 	if keyMethod == "sky_key" {
-		return textResult("key_method 'sky_key' is not supported on Linux", true)
+		return errorResult(codeInvalidArgument, "key_method 'sky_key' is not supported on Linux", "")
 	}
 	if s.currentSnapshot(app) == nil {
-		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+		return noAppStateResult(app)
 	}
 	return s.actionResult(app, linuxRequest{Tool: "press_key", App: app, Key: key, AllowPasswordInput: allowPassword})
 }
 
 func (s *service) setValue(app, elementIndex, value string, allowPassword bool) toolCallResult {
 	if app == "" {
-		return textResult("Missing required argument: app", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: app", "")
 	}
 	if elementIndex == "" {
-		return textResult("Missing required argument: element_index", true)
+		return errorResult(codeInvalidArgument, "Missing required argument: element_index", "")
 	}
 	snapshot := s.currentSnapshot(app)
 	if snapshot == nil {
-		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+		return noAppStateResult(app)
 	}
 	record, err := lookupElement(snapshot, elementIndex)
 	if err != nil {
-		return textResult(err.Error(), true)
+		return unknownElementResult(err)
 	}
 	return s.actionResult(app, linuxRequest{Tool: "set_value", App: app, Element: record, Value: value, AllowPasswordInput: allowPassword})
+}
+
+func unknownElementResult(err error) toolCallResult {
+	return errorResult(codeNotFound, err.Error(), "Use an element number from the latest get_app_state.")
 }
 
 func (s *service) actionResult(app string, request linuxRequest) toolCallResult {
 	if !actionReadBackEnabled() {
 		request.SkipReadBack = true
-		response, err := runPython(request)
+		response, err := s.runBridge(request)
 		if err != nil {
-			return textResult(err.Error(), true)
+			return bridgeFailure(err.Error(), "", "", true)
 		}
 		if !response.OK {
-			return textResult(response.Error, true)
+			return bridgeFailure(response.Error, response.Code, response.Suggestion, true)
 		}
 		// Keep the last explicitly observed indexes until get_app_state refreshes them.
 		return textResult("ok", false)
@@ -548,15 +558,16 @@ func (s *service) currentSnapshot(app string) *appSnapshot {
 }
 
 func (s *service) refreshSnapshot(app string, request linuxRequest) (*appSnapshot, toolCallResult) {
-	response, err := runPython(request)
+	action := request.Tool != "get_app_state"
+	response, err := s.runBridge(request)
 	if err != nil {
-		return nil, textResult(err.Error(), true)
+		return nil, bridgeFailure(err.Error(), "", "", action)
 	}
 	if !response.OK {
-		return nil, textResult(response.Error, true)
+		return nil, bridgeFailure(response.Error, response.Code, response.Suggestion, action)
 	}
 	if response.Snapshot == nil {
-		return nil, textResult("Linux runtime did not return an app snapshot.", true)
+		return nil, bridgeFailure("Linux runtime did not return an app snapshot.", "", "", action)
 	}
 	if request.IncludeScreenshot != nil && !*request.IncludeScreenshot {
 		response.Snapshot.ScreenshotPNGBase64 = ""

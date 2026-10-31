@@ -28,6 +28,7 @@ $env:OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS="1"
 go -C apps/OpenComputerUseWindows test ./...
 go -C apps/OpenComputerUseWindows build -o "$env:TEMP/ocu-input.exe" .
 powershell.exe -NoProfile -File scripts/tests/windows-input.test.ps1 -RuntimePath apps/OpenComputerUseWindows/runtime.ps1
+powershell.exe -NoProfile -File scripts/tests/windows-pi-phone.test.ps1 -RuntimePath apps/OpenComputerUseWindows/runtime.ps1
 pwsh -File scripts/tests/windows-input-smoke.ps1 -NativePath "$env:TEMP/ocu-input.exe"
 ```
 

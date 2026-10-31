@@ -206,9 +206,18 @@ function Test-ElementIsPassword($element) {
 # typing their own password); every other call keeps the guard.
 $script:AllowPasswordInputThisCall = $false
 
+# pi-phone fork (PP-270): a refusal with a machine-readable code (stale_ref, ambiguous_target,
+# policy_denied, covered, not_found, password_field), raised before anything reaches the app.
+function New-OCUError([string]$Code, [string]$Message, [string]$Suggestion = "") {
+    $exception = New-Object System.InvalidOperationException $Message
+    $exception.Data["ocuCode"] = $Code
+    $exception.Data["ocuSuggestion"] = $Suggestion
+    return $exception
+}
+
 function Assert-NotPasswordInput($element) {
     if ((Test-ElementIsPassword $element) -and -not $script:AllowPasswordInputThisCall -and -not (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT")) {
-        throw "Refused: the target is a password field. Open Computer Use (pi-phone build) does not type into password fields; set OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT=1 to allow it."
+        throw (New-OCUError "password_field" "Refused: the target is a password field. Open Computer Use (pi-phone build) does not type into password fields; set OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT=1 to allow it.")
     }
 }
 
@@ -370,7 +379,7 @@ function Test-GlobalPointerFallbackEnabled {
 }
 
 function Assert-GlobalInputTarget([IntPtr]$hwnd, [bool]$AllowActivation = $true) {
-    if (-not (Test-GlobalPointerFallbackEnabled)) { throw "Global input requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1" }
+    if (-not (Test-GlobalPointerFallbackEnabled)) { throw (New-OCUError "policy_denied" "Global input requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1") }
     if ($null -eq (Get-CapturableWindowFrame $hwnd)) { throw "Global input requires a visible, usable target window. Run get_app_state again." }
     if ([OCUWin32]::GetForegroundWindow() -ne $hwnd -and $AllowActivation) {
         [void][OCUWin32]::SetForegroundWindow($hwnd)
@@ -401,7 +410,7 @@ function Assert-GlobalPointerTarget([IntPtr]$hwnd, [int]$x, [int]$y, $bounds, [b
     $point.X = $x; $point.Y = $y
     $hit = [OCUWin32]::WindowFromPoint($point)
     if ($hit -eq [IntPtr]::Zero -or [OCUWin32]::GetAncestor($hit, 2) -ne $hwnd) {
-        throw "Global input refused: point is covered by another window."
+        throw (New-OCUError "covered" "Global input refused: point is covered by another window.")
     }
 }
 
@@ -699,7 +708,7 @@ function Resolve-App([string]$query) {
         }
     }
 
-    throw "appNotFound(`"$query`")"
+    throw (New-OCUError "not_found" "appNotFound(`"$query`")")
 }
 
 function Get-MainElement($process) {
@@ -1323,7 +1332,7 @@ try {
         $hwnd = [IntPtr]$process.MainWindowHandle
         if (($operation.expected_pid -gt 0 -and $process.Id -ne $operation.expected_pid) -or
             ($operation.windowHandle -gt 0 -and [long]$hwnd -ne $operation.windowHandle)) {
-            throw "Target process/window changed; run get_app_state before acting."
+            throw (New-OCUError "stale_ref" "Target process/window changed; run get_app_state before acting.")
         }
         $windowBounds = $operation.windowBounds
         $element = Find-Element $process $operation.element
@@ -1447,10 +1456,16 @@ try {
     }
 } catch {
     $message = $_.Exception.Message
-    if (-not [string]::IsNullOrWhiteSpace($_.ScriptStackTrace)) {
-        $message = "$message at $($_.ScriptStackTrace)"
+    $code = $_.Exception.Data["ocuCode"]
+    if ($null -ne $code) {
+        # pi-phone fork: a coded refusal keeps its plain message.
+        $response = [pscustomobject]@{ ok = $false; error = $message; code = [string]$code; suggestion = [string]$_.Exception.Data["ocuSuggestion"] }
+    } else {
+        if (-not [string]::IsNullOrWhiteSpace($_.ScriptStackTrace)) {
+            $message = "$message at $($_.ScriptStackTrace)"
+        }
+        $response = [pscustomobject]@{ ok = $false; error = $message }
     }
-    $response = [pscustomobject]@{ ok = $false; error = $message }
 }
 
 $response | ConvertTo-Json -Depth 50 -Compress

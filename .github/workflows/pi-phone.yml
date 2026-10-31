@@ -39,6 +39,8 @@ jobs:
       - name: Windows runtime builds
         working-directory: apps/OpenComputerUseWindows
         run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null .
+      - name: Windows runtime pi-phone functions (pwsh, instrumented doubles)
+        run: pwsh -NoProfile -NonInteractive -File ./scripts/tests/windows-pi-phone.test.ps1 -RuntimePath apps/OpenComputerUseWindows/runtime.ps1
 
   test-windows:
     runs-on: windows-2025
@@ -65,6 +67,8 @@ jobs:
       - name: PowerShell collection branches
         run: |
           powershell.exe -NoProfile -NonInteractive -File ./scripts/tests/windows-observation.test.ps1 -RuntimePath apps/OpenComputerUseWindows/runtime.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoProfile -NonInteractive -File ./scripts/tests/windows-pi-phone.test.ps1 -RuntimePath apps/OpenComputerUseWindows/runtime.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Real WPF password-field guard (pi-phone)
         run: ./scripts/tests/windows-password-smoke.ps1 -NativePath "$env:RUNNER_TEMP/ocu.exe"

@@ -9,6 +9,10 @@
 - macOS 真实 app 路径依赖 `Open Computer Use.app` 已获得 `Accessibility` 与 `Screen Recording` 权限；终端里的 CLI / Node launcher 会把 `mcp`、`doctor`、`call`、`snapshot` 和 `list-apps` 转发给由 LaunchServices 启动的本地 app agent，避免把权限要求落到 iTerm / Terminal 身上。
 - 实验性 Linux runtime 依赖已登录桌面用户的 AT-SPI2 / D-Bus session；coordinate mouse、drag、keyboard synthesis 只是 best-effort fallback，不应被视为跨 Wayland compositor 的通用后台输入授权。
 
+## pi-phone fork（PP-270）
+
+- 拒绝与失败都附带机器可读的一行 `Error: <code> retry=<safe|unsafe> suggestion=<text>`。详见 [PI-PHONE.md](../PI-PHONE.md)。
+
 ## 数据处理
 
 - 普通 app 的 screenshot 默认只在内存中编码成 PNG（可配置为 JPG 或无损 WebP），并通过 MCP `image` content block 直接回传；默认不长期持久化。

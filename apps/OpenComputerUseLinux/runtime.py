@@ -39,6 +39,19 @@ PASSWORD_REFUSAL = (
 )
 
 
+class OCUError(RuntimeError):
+    """pi-phone fork: a refusal or failure with a machine-readable code.
+
+    Codes: stale_ref, ambiguous_target, policy_denied, covered, not_found, password_field. Each is raised
+    before anything reaches the app, so retrying after a fresh read is safe.
+    """
+
+    def __init__(self, code, message, suggestion=""):
+        super().__init__(message)
+        self.code = code
+        self.suggestion = suggestion
+
+
 def frame(x, y, width, height):
     if width is None or height is None or width < 0 or height < 0:
         return None
@@ -135,7 +148,7 @@ def focused_node(root):
 def refuse_password_input(node, allowed=False):
     """allowed: this call opted out (allow_password_input), a person typing their own password."""
     if is_password(node) and not allowed and not password_input_allowed():
-        raise RuntimeError(PASSWORD_REFUSAL)
+        raise OCUError("password_field", PASSWORD_REFUSAL)
 
 
 def node_pid(node):
@@ -241,7 +254,7 @@ def resolve_app(query):
     for app in iter_apps():
         if matches_query(app, query):
             return app
-    raise RuntimeError('appNotFound("{}")'.format(query))
+    raise OCUError("not_found", 'appNotFound("{}")'.format(query))
 
 
 def action_names(node):
@@ -987,6 +1000,10 @@ def main():
         operation = json.load(file)
     try:
         response = perform_operation(operation)
+    except OCUError as exc:
+        response = {"ok": False, "error": str(exc), "code": exc.code}
+        if exc.suggestion:
+            response["suggestion"] = exc.suggestion
     except Exception as exc:
         response = {"ok": False, "error": str(exc)}
     print(json.dumps(response, separators=(",", ":")))

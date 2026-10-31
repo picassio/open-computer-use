@@ -19,8 +19,12 @@ The fork's work is on the `pi-phone` branch. `main` follows upstream.
   - One call may opt out with `allow_password_input: true` on `set_value`, `type_text` or `press_key` (pi-phone sets it only for the owner typing on a taken-over window, and for a saved secret filled by name); every other call keeps the guard. Anything but a boolean `true` is no opt-out.
   - A host may opt out for every call with `OPEN_COMPUTER_USE_ALLOW_PASSWORD_INPUT=1`.
 - **Linux `type_text`:** writes into the focused editable field first, then the first editable field, as upstream did.
+
+PP-270 phase 1 (ideas from [vercel-labs/agent-desktop](https://github.com/vercel-labs/agent-desktop), Apache-2.0, reimplemented here; no code copied):
+
+- **Structured errors:** every refusal and failure ends with `Error: <code> retry=<safe|unsafe> suggestion=<text>` after the human message, and `structuredContent.error` holds the same. Codes: `stale_ref`, `ambiguous_target`, `policy_denied`, `covered`, `not_found`, `password_field`, plus `invalid_argument` (bad arguments), `action_failed` (an action failed in the runtime; it may have happened, so `retry=unsafe`) and `failed` (a read failed). Every other code is raised before anything reaches the app, so `retry=safe`.
 - **Releases:**
-  - `.github/workflows/pi-phone.yml` tests both runtimes, including a real WPF password-box smoke on Windows.
+  - `.github/workflows/pi-phone.yml` tests both runtimes, including a real WPF password-box smoke on Windows. `windows-pi-phone.test.ps1` runs runtime.ps1's own functions against doubles under Windows PowerShell and, on Linux, pwsh.
   - On a `v*-pp.*` tag, it publishes `open-computer-use-linux-x64`, `open-computer-use-linux-arm64` and `open-computer-use-windows-x64.exe` with `SHA256SUMS`.
   - Upstream's macOS/npm `release.yml` runs only by hand in this fork.
 

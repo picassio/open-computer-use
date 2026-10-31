@@ -586,5 +586,27 @@ class PasswordFieldTests(unittest.TestCase):
                 self.assertEqual(self.runtime.types_character(key), expected)
 
 
+class ErrorCodeTests(unittest.TestCase):
+    """pi-phone fork: refusals reach the Go side with their code."""
+
+    def test_main_reports_the_code_of_a_refusal(self):
+        import io
+        import tempfile
+        runtime = load_runtime()
+        runtime.Atspi.init = lambda: None
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            handle.write('{"tool": "set_value"}')
+        self.addCleanup(pathlib.Path(handle.name).unlink)
+        output = io.StringIO()
+        with mock.patch.object(runtime, "require_desktop_session"), \
+             mock.patch.object(runtime, "perform_operation", side_effect=runtime.OCUError("password_field", runtime.PASSWORD_REFUSAL)), \
+             mock.patch.object(runtime.sys, "argv", ["runtime.py", handle.name]), \
+             contextlib.redirect_stdout(output):
+            runtime.main()
+        response = __import__("json").loads(output.getvalue())
+        self.assertEqual((response["ok"], response["code"]), (False, "password_field"))
+        self.assertIn("password field", response["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
