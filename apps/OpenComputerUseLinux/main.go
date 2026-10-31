@@ -199,11 +199,14 @@ type linuxRequest struct {
 	// must still find (stale_ref when it is gone); explicit_window pins the read after the action to it.
 	WindowID       string `json:"window_id,omitempty"`
 	ExplicitWindow bool   `json:"explicit_window,omitempty"`
+	// pi-phone fork: this call may use physical input (drag, coordinate or global clicks).
+	Headed bool `json:"headed,omitempty"`
 }
 
-// callOptions are an action's pi-phone fork arguments: snapshot_id and window_id.
+// callOptions are an action's pi-phone fork arguments: snapshot_id, window_id and headed.
 type callOptions struct {
-	refs refArguments
+	refs   refArguments
+	headed bool
 }
 
 func optionsOf(opts []callOptions) callOptions {
@@ -297,12 +300,16 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 		return s.getAppState(requiredString(args, "app"), textLimit, maxTreeNodes, maxTreeDepth, includeAX, includeScreenshot, refs.windowID, refuse)
 	}
 
-	// pi-phone fork: every action takes snapshot_id and window_id.
+	// pi-phone fork: every action takes snapshot_id and window_id; drag and clicks take headed.
 	refs, err := refArgumentsFrom(args)
 	if err != nil {
 		return invalidArgument(err)
 	}
-	opts := callOptions{refs: refs}
+	headed, err := headedArgument(args)
+	if err != nil {
+		return invalidArgument(err)
+	}
+	opts := callOptions{refs: refs, headed: headed}
 
 	switch name {
 	case "click":
@@ -455,6 +462,10 @@ func (s *service) click(app, elementIndex string, x, y *float64, clickCount int,
 	if clickMethod == "global" && !globalPointerFallbacksEnabled() {
 		return errorResult(codePolicyDenied, "click_method 'global' requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 because it may move the system pointer and change foreground focus", "")
 	}
+	// pi-phone fork: coordinate and global clicks synthesize real pointer input.
+	if (elementIndex == "" || clickMethod == "global") && !opts.headed {
+		return headedRequiredResult("a coordinate or global click")
+	}
 	snapshot, refusal := s.actionSnapshot(app, opts.refs)
 	if refusal != nil {
 		return *refusal
@@ -474,6 +485,7 @@ func (s *service) click(app, elementIndex string, x, y *float64, clickCount int,
 		MouseButton:  mouseButton,
 		ClickMethod:  clickMethod,
 		WindowBounds: snapshot.WindowBounds,
+		Headed:       opts.headed,
 	}
 	if elementIndex != "" {
 		record, err := lookupElement(snapshot, elementIndex)
@@ -550,6 +562,10 @@ func (s *service) drag(app string, fromX, fromY, toX, toY *float64, options ...c
 	if toY == nil {
 		return errorResult(codeInvalidArgument, "Missing required argument: to_y", "")
 	}
+	// pi-phone fork: a drag synthesizes real pointer input (PP-269 spike: it worked without any gate).
+	if !opts.headed {
+		return headedRequiredResult("drag")
+	}
 	snapshot, refusal := s.actionSnapshot(app, opts.refs)
 	if refusal != nil {
 		return *refusal
@@ -562,7 +578,7 @@ func (s *service) drag(app string, fromX, fromY, toX, toY *float64, options ...c
 			return coveredPointResult(point[0], point[1])
 		}
 	}
-	return s.actionResult(app, s.pinned(linuxRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, WindowBounds: snapshot.WindowBounds}, snapshot, opts))
+	return s.actionResult(app, s.pinned(linuxRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, WindowBounds: snapshot.WindowBounds, Headed: opts.headed}, snapshot, opts))
 }
 
 func (s *service) typeText(app, text, keyMethod string, allowPassword bool, options ...callOptions) toolCallResult {

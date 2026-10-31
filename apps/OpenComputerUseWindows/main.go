@@ -256,13 +256,15 @@ type psRequest struct {
 
 	// pi-phone fork: windowHandle is the window get_app_state reads (window_id) or the snapshot's
 	// window an action must still find (stale_ref when it is gone); explicit_window pins the read
-	// after the action to it.
+	// after the action to it. headed allows physical input on this call.
 	ExplicitWindow bool `json:"explicit_window,omitempty"`
+	Headed         bool `json:"headed,omitempty"`
 }
 
-// callOptions are an action's pi-phone fork arguments: snapshot_id and window_id.
+// callOptions are an action's pi-phone fork arguments: snapshot_id, window_id and headed.
 type callOptions struct {
-	refs refArguments
+	refs   refArguments
+	headed bool
 }
 
 func optionsOf(opts []callOptions) callOptions {
@@ -360,12 +362,16 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 		return s.getAppState(requiredString(args, "app"), textLimit, maxTreeNodes, maxTreeDepth, includeAX, includeScreenshot, windowHandle, refuse)
 	}
 
-	// pi-phone fork: every action takes snapshot_id and window_id.
+	// pi-phone fork: every action takes snapshot_id and window_id; drag, clicks and press_key take headed.
 	refs, err := refArgumentsFrom(args)
 	if err != nil {
 		return invalidArgument(err)
 	}
-	opts := callOptions{refs: refs}
+	headed, err := headedArgument(args)
+	if err != nil {
+		return invalidArgument(err)
+	}
+	opts := callOptions{refs: refs, headed: headed}
 
 	switch name {
 	case "click":
@@ -515,6 +521,10 @@ func (s *service) click(app, elementIndex string, x, y *float64, clickCount int,
 	if clickMethod == "global" && !globalPointerFallbacksEnabled() {
 		return errorResult(codePolicyDenied, "click_method 'global' requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 because it may move the system pointer and change foreground focus", "")
 	}
+	// pi-phone fork: coordinate clicks act at a point of the picture, global ones with the real pointer.
+	if (elementIndex == "" || clickMethod == "global") && !opts.headed {
+		return headedRequiredResult("a coordinate or global click")
+	}
 	snapshot, refusal := s.actionSnapshot(app, opts.refs)
 	if refusal != nil {
 		return *refusal
@@ -534,6 +544,7 @@ func (s *service) click(app, elementIndex string, x, y *float64, clickCount int,
 		MouseButton:  mouseButton,
 		ClickMethod:  clickMethod,
 		WindowBounds: snapshot.WindowBounds,
+		Headed:       opts.headed,
 	}
 	if elementIndex != "" {
 		record, err := lookupElement(snapshot, elementIndex)
@@ -610,6 +621,10 @@ func (s *service) drag(app string, fromX, fromY, toX, toY *float64, options ...c
 	if toY == nil {
 		return errorResult(codeInvalidArgument, "Missing required argument: to_y", "")
 	}
+	// pi-phone fork: a drag works at points of the picture (with the real pointer when allowed).
+	if !opts.headed {
+		return headedRequiredResult("drag")
+	}
 	snapshot, refusal := s.actionSnapshot(app, opts.refs)
 	if refusal != nil {
 		return *refusal
@@ -622,7 +637,7 @@ func (s *service) drag(app string, fromX, fromY, toX, toY *float64, options ...c
 			return coveredPointResult(point[0], point[1])
 		}
 	}
-	return s.actionResult(app, pinned(psRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, WindowBounds: snapshot.WindowBounds}, snapshot, opts))
+	return s.actionResult(app, pinned(psRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, WindowBounds: snapshot.WindowBounds, Headed: opts.headed}, snapshot, opts))
 }
 
 func screenshotCoordinatesUnavailableResult(app string, snapshot *appSnapshot) toolCallResult {
@@ -665,11 +680,15 @@ func (s *service) pressKey(app, key, keyMethod string, allowPassword bool, optio
 	if keyMethod == "global" && !globalPointerFallbacksEnabled() {
 		return errorResult(codePolicyDenied, "key_method global requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1", "")
 	}
+	// pi-phone fork: real keys need headed: true too.
+	if keyMethod == "global" && !opts.headed {
+		return headedRequiredResult("key_method global")
+	}
 	snapshot, refusal := s.actionSnapshot(app, opts.refs)
 	if refusal != nil {
 		return *refusal
 	}
-	return s.actionResult(app, pinned(psRequest{Tool: "press_key", App: app, Key: key, KeyMethod: keyMethod, AllowPasswordInput: allowPassword}, snapshot, opts))
+	return s.actionResult(app, pinned(psRequest{Tool: "press_key", App: app, Key: key, KeyMethod: keyMethod, AllowPasswordInput: allowPassword, Headed: opts.headed}, snapshot, opts))
 }
 
 func (s *service) setValue(app, elementIndex, value string, allowPassword bool, options ...callOptions) toolCallResult {

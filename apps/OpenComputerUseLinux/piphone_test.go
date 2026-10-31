@@ -1,6 +1,6 @@
 package main
 
-// pi-phone fork (PP-270) tests: snapshot ids, stale refs, covered regions, error codes.
+// pi-phone fork (PP-270) tests: snapshot ids, stale refs, covered regions, headed input, error codes.
 
 import (
 	"regexp"
@@ -205,6 +205,53 @@ func TestRuntimeRefusalsKeepTheirCode(t *testing.T) {
 	requireCode(t, s.callTool("click", map[string]any{"app": "demo", "element_index": "1", "snapshot_id": 7}), codeInvalidArgument, "safe")
 }
 
+func TestPhysicalInputNeedsHeaded(t *testing.T) {
+	t.Setenv("OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS", "1")
+	s, bridge := serviceWith(&linuxResponse{OK: true, Snapshot: demoSnapshot()})
+	s.callTool("get_app_state", map[string]any{"app": "demo"})
+	sent := len(bridge.requests)
+	for _, args := range []map[string]any{
+		{"tool": "drag", "from_x": 10, "from_y": 10, "to_x": 50, "to_y": 50},
+		{"tool": "click", "x": 10, "y": 10},
+		{"tool": "click", "x": 10, "y": 10, "headed": false},
+		{"tool": "click", "element_index": "1", "click_method": "global"},
+	} {
+		tool := args["tool"].(string)
+		delete(args, "tool")
+		args["app"] = "demo"
+		requireCode(t, s.callTool(tool, args), codePolicyDenied, "safe")
+	}
+	if len(bridge.requests) != sent {
+		t.Fatal("physical input without headed reached the runtime")
+	}
+	requireCode(t, s.callTool("drag", map[string]any{"app": "demo", "from_x": 1, "from_y": 1, "to_x": 2, "to_y": 2, "headed": "yes"}), codeInvalidArgument, "safe")
+
+	if result := s.callTool("click", map[string]any{"app": "demo", "element_index": "1"}); result.IsError {
+		t.Fatalf("an element click needs no headed: %#v", result)
+	}
+	if bridge.requests[len(bridge.requests)-1].Headed {
+		t.Fatal("headed sent without the flag")
+	}
+	for _, c := range []struct {
+		tool string
+		args map[string]any
+	}{
+		{"drag", map[string]any{"from_x": 10, "from_y": 10, "to_x": 50, "to_y": 50}},
+		{"click", map[string]any{"x": 10, "y": 10}},
+	} {
+		c.args["app"] = "demo"
+		c.args["headed"] = true
+		if result := s.callTool(c.tool, c.args); result.IsError {
+			t.Fatalf("%s with headed: %#v", c.tool, result)
+		}
+		if request := bridge.requests[len(bridge.requests)-1]; !request.Headed || request.Tool != c.tool {
+			t.Fatalf("headed did not reach the runtime: %#v", request)
+		}
+	}
+	t.Setenv("OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS", "")
+	requireCode(t, s.callTool("click", map[string]any{"app": "demo", "element_index": "1", "click_method": "global", "headed": true}), codePolicyDenied, "safe")
+}
+
 func TestCoordinatesInACoveredPartAreRefused(t *testing.T) {
 	read := demoSnapshot()
 	read.Cover = "partial"
@@ -212,12 +259,12 @@ func TestCoordinatesInACoveredPartAreRefused(t *testing.T) {
 	s, bridge := serviceWith(&linuxResponse{OK: true, Snapshot: read})
 	s.callTool("get_app_state", map[string]any{"app": "demo"})
 	sent := len(bridge.requests)
-	requireCode(t, s.callTool("click", map[string]any{"app": "demo", "x": 350, "y": 20}), codeCovered, "safe")
-	requireCode(t, s.callTool("drag", map[string]any{"app": "demo", "from_x": 10, "from_y": 10, "to_x": 399, "to_y": 149}), codeCovered, "safe")
+	requireCode(t, s.callTool("click", map[string]any{"app": "demo", "x": 350, "y": 20, "headed": true}), codeCovered, "safe")
+	requireCode(t, s.callTool("drag", map[string]any{"app": "demo", "from_x": 10, "from_y": 10, "to_x": 399, "to_y": 149, "headed": true}), codeCovered, "safe")
 	if len(bridge.requests) != sent {
 		t.Fatal("a covered point reached the runtime")
 	}
-	if result := s.callTool("click", map[string]any{"app": "demo", "x": 299, "y": 20}); result.IsError {
+	if result := s.callTool("click", map[string]any{"app": "demo", "x": 299, "y": 20, "headed": true}); result.IsError {
 		t.Fatalf("an uncovered point was refused: %#v", result)
 	}
 }
@@ -237,7 +284,7 @@ func TestFullyCoveredOrMinimisedWindowsSayWhyThereIsNoScreenshot(t *testing.T) {
 		if len(result.Content) != 1 || !strings.Contains(result.Content[0].Text, want) {
 			t.Fatalf("%s: %#v", cover, result)
 		}
-		requireCode(t, s.callTool("click", map[string]any{"app": "demo", "x": 5, "y": 5}), codeCovered, "safe")
+		requireCode(t, s.callTool("click", map[string]any{"app": "demo", "x": 5, "y": 5, "headed": true}), codeCovered, "safe")
 	}
 }
 
@@ -267,6 +314,7 @@ func TestToolSchemasCarryTheForkArguments(t *testing.T) {
 		properties := tool.InputSchema["properties"].(map[string]any)
 		_, snapshotID := properties["snapshot_id"]
 		_, windowID := properties["window_id"]
+		_, headed := properties["headed"]
 		_, refuse := properties["refuse_if_covered"]
 		switch tool.Name {
 		case "list_apps":
@@ -278,7 +326,7 @@ func TestToolSchemasCarryTheForkArguments(t *testing.T) {
 				t.Fatalf("get_app_state: %#v", properties)
 			}
 		default:
-			if !snapshotID || !windowID {
+			if !snapshotID || !windowID || headed != (tool.Name == "click" || tool.Name == "drag") {
 				t.Fatalf("%s: %#v", tool.Name, properties)
 			}
 		}

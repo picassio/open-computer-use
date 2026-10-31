@@ -1,7 +1,7 @@
 package main
 
-// pi-phone fork (PP-270): structured errors, snapshot-scoped refs and covered window regions.
-// See PI-PHONE.md.
+// pi-phone fork (PP-270): structured errors, snapshot-scoped refs, covered window regions and
+// the per-call headed flag for physical input. See PI-PHONE.md.
 
 import (
 	"crypto/rand"
@@ -27,7 +27,7 @@ const (
 var defaultSuggestions = map[string]string{
 	codeStaleRef:        "Call get_app_state again and act on its element numbers and snapshot id.",
 	codeAmbiguousTarget: "Read the app again, with a window_id from the outline if several windows match.",
-	codePolicyDenied:    "Use an element_index action; this physical input is not allowed here.",
+	codePolicyDenied:    "Use an element_index action; physical input needs headed: true, which only the host sends.",
 	codeCovered:         "Bring the window to the front or move what covers it, then read it again.",
 	codeNotFound:        "Check the app, window or element number, then read the app again with get_app_state.",
 	codePasswordField:   "Do not type into a password field; ask the person to type it.",
@@ -175,6 +175,19 @@ func coveredPointResult(x, y float64) toolCallResult {
 	return errorResult(codeCovered, fmt.Sprintf("Refused: (%.0f, %.0f) is covered by another window in the last read; the input would land there.", x, y), "")
 }
 
+func headedRequiredResult(what string) toolCallResult {
+	return errorResult(codePolicyDenied, "Refused: "+what+" is physical input (it moves the real pointer or keyboard) and needs headed: true on the call.", "")
+}
+
+// headedArgument reads the per-call headed flag: only a boolean true counts.
+func headedArgument(args map[string]any) (bool, error) {
+	value, err := optionalBool(args, "headed")
+	if err != nil || value == nil {
+		return false, err
+	}
+	return *value, nil
+}
+
 // refArguments are the optional snapshot_id and window_id of an action.
 type refArguments struct {
 	snapshotID string
@@ -233,6 +246,11 @@ var (
 		"type":        "string",
 		"description": "pi-phone build: a Window id from the outline. get_app_state reads that window; an action is refused with stale_ref unless the latest read is of it.",
 	}
+	headedProperty = map[string]any{
+		"type":        "boolean",
+		"default":     false,
+		"description": "pi-phone build: allow physical input (drag, coordinate or global clicks) on this call. Without it they are refused with policy_denied. Only the host sets it.",
+	}
 	refuseIfCoveredProperty = map[string]any{
 		"type":        "boolean",
 		"default":     false,
@@ -253,6 +271,9 @@ func withPiPhoneProperties(tools []toolDefinition) []toolDefinition {
 			continue
 		}
 		properties["snapshot_id"] = snapshotIDProperty
+		if tool.Name == "click" || tool.Name == "drag" {
+			properties["headed"] = headedProperty
+		}
 	}
 	return tools
 }

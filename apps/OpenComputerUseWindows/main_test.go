@@ -61,7 +61,7 @@ func TestWindowsGlobalClickRequiresGlobalPointerFallbackOptIn(t *testing.T) {
 	if !globalPointerFallbacksEnabled() {
 		t.Fatal("global pointer authorization should accept yes")
 	}
-	result = newService().click("Notepad", "", &x, &y, 1, "left", "global")
+	result = newService().click("Notepad", "", &x, &y, 1, "left", "global", callOptions{headed: true})
 	if !result.IsError || !strings.Contains(result.Content[0].Text, "No app state is available") {
 		t.Fatalf("authorized global click result = %#v", result)
 	}
@@ -390,7 +390,7 @@ func TestWindowsCoordinateActionsRequireUsableScreenshot(t *testing.T) {
 		Elements:     []elementRecord{{Index: 0}},
 	}
 	x, y := 1.0, 1.0
-	clickResult := svc.click("fixture", "", &x, &y, 1, "left", "auto")
+	clickResult := svc.click("fixture", "", &x, &y, 1, "left", "auto", callOptions{headed: true})
 	if !clickResult.IsError || !strings.Contains(clickResult.Content[0].Text, "No usable screenshot is available") {
 		t.Fatalf("coordinate click result = %#v", clickResult)
 	}
@@ -398,7 +398,7 @@ func TestWindowsCoordinateActionsRequireUsableScreenshot(t *testing.T) {
 	if !appPostResult.IsError || !strings.Contains(appPostResult.Content[0].Text, "No usable screenshot is available") {
 		t.Fatalf("app_post click result = %#v", appPostResult)
 	}
-	dragResult := svc.drag("fixture", &x, &y, &x, &y)
+	dragResult := svc.drag("fixture", &x, &y, &x, &y, callOptions{headed: true})
 	if !dragResult.IsError || !strings.Contains(dragResult.Content[0].Text, "No usable screenshot is available") {
 		t.Fatalf("coordinate drag result = %#v", dragResult)
 	}

@@ -1,15 +1,15 @@
 param([Parameter(Mandatory = $true)][string]$RuntimePath)
 $ErrorActionPreference = "Stop"
-# pi-phone fork (PP-270): run runtime.ps1's own functions for coded errors, element states, stale refs
-# and covered regions against instrumented doubles. Runs under pwsh on Linux too; the
+# pi-phone fork (PP-270): run runtime.ps1's own functions for coded errors, element states, stale refs,
+# covered regions and the headed gate against instrumented doubles. Runs under pwsh on Linux too; the
 # real UI Automation and z-order paths are covered by windows-pi-phone-smoke.ps1 on a Windows desktop.
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($RuntimePath, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
 $names = @("New-OCUError", "New-Frame", "Limit-Text", "ConvertTo-StateNames", "Test-NamesMatch", "ConvertTo-ComparableActions",
     "Test-RecordMatches", "New-StaleElementError", "Get-UnionArea", "Get-Overlap", "Get-CoveredRegions", "Get-BlackoutRects",
-    "Get-ElementTitle", "Format-ElementLine", "Find-Element", "Same-RuntimeId", "Resolve-TargetWindow",
-    "Test-EnvFlagEnabled", "Assert-NotPasswordInput", "Test-ElementIsPassword")
+    "Get-ElementTitle", "Format-ElementLine", "Find-Element", "Same-RuntimeId", "Resolve-TargetWindow", "Assert-Headed",
+    "Test-EnvFlagEnabled", "Test-GlobalPointerFallbackEnabled", "Assert-NotPasswordInput", "Test-ElementIsPassword")
 $functions = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names }, $true)
 if ($functions.Count -ne $names.Count) { throw "Production functions missing: $($names | Where-Object { $_ -notin $functions.Name })" }
 foreach ($function in $functions) { Invoke-Expression $function.Extent.Text }
@@ -109,4 +109,15 @@ $strips = @(Get-BlackoutRects $bounds @((New-Frame 300 0 100 150)) $painted)
 Assert ($strips.Count -eq 4 -and $strips[0].x -eq 300) "Blackout keeps the covered part first: $($strips | ConvertTo-Json -Depth 3)"
 Assert (($strips | Where-Object { $_.x -eq 0 -and $_.width -eq 7 }) -and ($strips | Where-Object { $_.x -eq 393 -and $_.width -eq 7 }) -and ($strips | Where-Object { $_.y -eq 293 -and $_.height -eq 7 })) "Invisible borders not blacked out"
 
-Write-Output "pi-phone runtime functions: coded errors, states, stale refs, window replacement and covered regions passed (instrumented doubles)."
+# Physical input needs the environment gate and headed: true.
+$env:OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS = "1"
+$script:HeadedThisCall = $false
+Assert (-not (Test-GlobalPointerFallbackEnabled)) "The environment gate alone allowed physical input"
+Assert ((Code { Assert-Headed "drag" }) -eq "policy_denied") "drag without headed"
+$script:HeadedThisCall = $true
+Assert (Test-GlobalPointerFallbackEnabled) "headed with the gate"
+Assert ((Code { Assert-Headed "drag" }) -eq "none") "headed drag refused"
+$env:OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS = ""
+Assert (-not (Test-GlobalPointerFallbackEnabled)) "headed without the gate"
+
+Write-Output "pi-phone runtime functions: coded errors, states, stale refs, window replacement, covered regions and the headed gate passed (instrumented doubles)."

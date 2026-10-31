@@ -217,7 +217,7 @@ func TestScreenshotOnlyInvalidatesIndexesAcrossWindowAndProcessChanges(t *testin
 				t.Fatal("stale element action accepted")
 			}
 			x, y := 10.0, 20.0
-			if result := s.click("Editor", "", &x, &y, 1, "left", "auto"); result.IsError {
+			if result := s.click("Editor", "", &x, &y, 1, "left", "auto", callOptions{headed: true}); result.IsError {
 				t.Fatalf("coordinate action unavailable: %#v", result)
 			}
 			data, err := os.ReadFile(path)

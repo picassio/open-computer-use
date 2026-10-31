@@ -87,7 +87,7 @@ func TestObservationInvalidatesOlderAliasesAcrossProcessReplacement(t *testing.T
 		t.Fatal("stale element action accepted")
 	}
 	x, y := 10.0, 20.0
-	if result := s.click("Editor", "", &x, &y, 1, "left", "auto"); result.IsError {
+	if result := s.click("Editor", "", &x, &y, 1, "left", "auto", callOptions{headed: true}); result.IsError {
 		t.Fatal("screenshot-only coordinate action failed", result)
 	}
 	if result := s.callTool("get_app_state", map[string]any{"app": "Editor", "include_screenshot": false}); result.IsError {
@@ -96,7 +96,7 @@ func TestObservationInvalidatesOlderAliasesAcrossProcessReplacement(t *testing.T
 	if _, err := lookupElement(s.currentSnapshot("Editor"), "8"); err != nil {
 		t.Fatal("AX refresh did not restore indexes", err)
 	}
-	if result := s.click("Editor", "", &x, &y, 1, "left", "auto"); !result.IsError || !strings.Contains(result.Content[0].Text, "No usable screenshot") {
+	if result := s.click("Editor", "", &x, &y, 1, "left", "auto", callOptions{headed: true}); !result.IsError || !strings.Contains(result.Content[0].Text, "No usable screenshot") {
 		t.Fatal("AX-only observation accepted screenshot coordinates")
 	}
 	if result := s.setValue("Editor", "8", "works", false); result.IsError {

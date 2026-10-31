@@ -72,7 +72,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Real WPF password-field guard (pi-phone)
         run: ./scripts/tests/windows-password-smoke.ps1 -NativePath "$env:RUNNER_TEMP/ocu.exe"
-      - name: Real WPF snapshot refs, check box state and covered window (pi-phone)
+      - name: Real WPF snapshot refs, check box state, covered window and headed input (pi-phone)
         run: ./scripts/tests/windows-pi-phone-smoke.ps1 -NativePath "$env:RUNNER_TEMP/ocu.exe"
       - name: Real WPF and native MCP (upstream observation smoke)
         run: ./scripts/tests/windows-observation-smoke.ps1 -NativePath "$env:RUNNER_TEMP/ocu.exe"

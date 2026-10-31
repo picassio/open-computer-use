@@ -18,7 +18,7 @@ $env:OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS="1"
 
 原生 MCP / CLI 参数使用 `click_method`、`key_method`。`type_text` 不提供 global 方式；`sky_click` / `sky_key` 是 macOS 能力。
 
-pi-phone fork（PP-270）：坐标落在上次观察中被其他窗口遮挡的区域时以 `covered` 拒绝。见 [PI-PHONE.md](../PI-PHONE.md)。
+pi-phone fork（PP-270）：`drag`、坐标点击（`x`/`y`，包括 `app_post`）、`click_method=global` 和 `press_key key_method=global` 还必须在本次调用中带 `headed: true`，否则在发送任何输入前以 `policy_denied` 拒绝。上表中的“真实指针 / 真实按键”需要环境开关与 `headed: true` 同时成立；auto 点击与 scroll 的回退在没有 `headed: true` 时保持窗口消息。坐标落在上次观察中被其他窗口遮挡的区域时以 `covered` 拒绝。见 [PI-PHONE.md](../PI-PHONE.md)。
 
 真实输入会移动系统指针，可能将目标放到前台。发送前核对已观察的进程 / 窗口、当前几何、前台及坐标命中窗口。按索引进行的物理输入还核对 UIA runtime ID 和当前元素位置，拒绝已消失、替换或移动的元素。窗口移动、被其他窗口遮挡或无法切换前台时会报错，需要重新观察或让目标可见。不会模拟 Alt 强行抢前台，也不会在指定 app_post / accessibility 失败时切到真实输入。
 
@@ -34,6 +34,8 @@ powershell.exe -NoProfile -File scripts/tests/windows-pi-phone.test.ps1 -Runtime
 pwsh -File scripts/tests/windows-input-smoke.ps1 -NativePath "$env:TEMP/ocu-input.exe"
 pwsh -File scripts/tests/windows-pi-phone-smoke.ps1 -NativePath "$env:TEMP/ocu-input.exe"
 ```
+
+注意：`windows-input-smoke.ps1` / `windows-input-js-smoke.mjs` 是上游测试，没有发送 `headed: true`；在 pi-phone fork 中它们的物理输入步骤会被 `policy_denied` 拒绝，pi-phone 的 CI 不运行它们。
 
 桌面测试需要已登录 Windows 会话、Windows PowerShell、pwsh 和 Node.js，只操作自有临时窗口。验证默认窗口消息滚动回退、四向滚轮、截图坐标点击、拖拽、组合键、输入释放、移动 / 遮挡拒绝、屏幕右侧捕获与 Worker JS。夹具自定义 WM_MOUSEWHEEL / WM_MOUSEHWHEEL 处理并更新真实 ScrollViewer 偏移，结果由独立状态文件确认；不代表所有 GUI toolkit 都响应窗口消息。
 

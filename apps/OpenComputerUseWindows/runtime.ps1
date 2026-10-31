@@ -292,6 +292,10 @@ function Assert-NotPasswordInput($element) {
     }
 }
 
+# pi-phone fork: physical input (SendInput) needs headed: true on the call as well as the
+# OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS gate; without it auto fallbacks stay on window messages.
+$script:HeadedThisCall = $false
+
 # pi-phone fork: the states an element line may carry, in this order ("States: checked, focused").
 $StateOrder = @("checked", "selected", "expanded", "collapsed", "focused", "disabled", "readonly", "secure")
 
@@ -468,6 +472,12 @@ function Get-OtherWindows([string]$query, [long]$chosen, [int]$limit = 8) {
     return $others.ToArray()
 }
 
+# Physical input needs the environment gate and this call's headed: true.
+function Assert-Headed([string]$what) {
+    if (-not $script:HeadedThisCall) {
+        throw (New-OCUError "policy_denied" "Refused: $what is physical input and needs headed: true on the call.")
+    }
+}
 
 function Get-FocusedElementOf($process) {
     try {
@@ -623,11 +633,12 @@ function Assert-UsableWindowBounds($windowBounds) {
 }
 
 function Test-GlobalPointerFallbackEnabled {
-    return (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS")
+    # pi-phone fork: and only on a call with headed: true.
+    return ((Test-EnvFlagEnabled "OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS") -and $script:HeadedThisCall)
 }
 
 function Assert-GlobalInputTarget([IntPtr]$hwnd, [bool]$AllowActivation = $true) {
-    if (-not (Test-GlobalPointerFallbackEnabled)) { throw (New-OCUError "policy_denied" "Global input requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1") }
+    if (-not (Test-GlobalPointerFallbackEnabled)) { throw (New-OCUError "policy_denied" "Global input requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 and headed: true on the call") }
     if ($null -eq (Get-CapturableWindowFrame $hwnd)) { throw "Global input requires a visible, usable target window. Run get_app_state again." }
     if ([OCUWin32]::GetForegroundWindow() -ne $hwnd -and $AllowActivation) {
         [void][OCUWin32]::SetForegroundWindow($hwnd)
@@ -1674,6 +1685,10 @@ try {
         $windowBounds = $operation.windowBounds
         $element = Find-Element $process $operation.element
         $script:AllowPasswordInputThisCall = ($operation.allow_password_input -is [bool]) -and $operation.allow_password_input
+        $script:HeadedThisCall = ($operation.headed -is [bool]) -and $operation.headed
+        if ($operation.tool -eq "drag") { Assert-Headed "drag" }
+        if ($operation.tool -eq "click" -and ($null -eq $operation.element -or $operation.click_method -eq "global")) { Assert-Headed "a coordinate or global click" }
+        if ($operation.tool -eq "press_key" -and $operation.key_method -eq "global") { Assert-Headed "key_method global" }
 
         switch ($operation.tool) {
             "click" {

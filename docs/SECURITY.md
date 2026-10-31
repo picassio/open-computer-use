@@ -13,6 +13,7 @@
 
 - 窗口截图会把覆盖在目标窗口上方的其他窗口区域涂黑并在输出中报告（`Covered: [...]` / `structuredContent.covered`）；完全被覆盖或最小化的窗口不返回截图。`get_app_state refuse_if_covered: true` 在有遮挡（或无法判断遮挡）时直接拒绝。Linux 通过 X11 堆叠顺序判断，Windows 通过 EnumWindows z-order 与 DWM 扩展边框判断。
 - 每次观察生成随机的 `Snapshot:` id；动作可带 `snapshot_id` / `window_id`，不是最新观察或窗口已被替换时以 `stale_ref` 拒绝；动作前按角色、名称、动作和 AT-SPI 对象路径 / UIA RuntimeId 重新确认元素，绝不对重新编号后的其他元素执行动作。旧 snapshot 只在内存中保留 id，不写入磁盘。
+- `drag`、坐标点击和 global 点击 / 按键需要本次调用带 `headed: true`（以及原有的环境开关），否则以 `policy_denied` 拒绝。
 - 拒绝与失败都附带机器可读的一行 `Error: <code> retry=<safe|unsafe> suggestion=<text>`。详见 [PI-PHONE.md](../PI-PHONE.md)。
 
 ## 数据处理

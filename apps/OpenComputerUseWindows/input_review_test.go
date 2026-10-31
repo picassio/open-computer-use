@@ -16,7 +16,7 @@ func TestActionPinsObservedWindowAndForwardsKeyboardMethod(t *testing.T) {
 				request = r
 				return &psResponse{OK: true, Snapshot: &appSnapshot{App: appDescriptor{Name: "fixture", PID: 42}, WindowHandle: 1234}}, nil
 			}
-			result := svc.callTool("press_key", map[string]any{"app": "fixture", "key": "ctrl+a", "key_method": method})
+			result := svc.callTool("press_key", map[string]any{"app": "fixture", "key": "ctrl+a", "key_method": method, "headed": true})
 			if result.IsError || request.ExpectedPID != 42 || request.WindowHandle != 1234 || request.KeyMethod != method {
 				t.Fatalf("action lost observed identity or explicit method: %#v, %#v", request, result)
 			}
@@ -72,7 +72,7 @@ func TestGlobalClickNeedsImageEvenWhenElementIndexExists(t *testing.T) {
 		t.Fatal("image-less global click reached bridge")
 		return nil, nil
 	}
-	result := svc.callTool("click", map[string]any{"app": "fixture", "element_index": "0", "click_method": "global"})
+	result := svc.callTool("click", map[string]any{"app": "fixture", "element_index": "0", "click_method": "global", "headed": true})
 	if !result.IsError || !strings.Contains(result.Content[0].Text, "screenshot") {
 		t.Fatalf("%#v", result)
 	}

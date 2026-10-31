@@ -29,6 +29,7 @@ public static class OCUWin32 {
  public static void MouseInput(uint flags,int data) { events.Add("mouse:"+flags+":"+data); }
  public static void KeyInput(int key,bool up) { events.Add("key:"+key+":"+up); if(up)keyUps++; if(!up&&key==loseFocusAfterKey)foreground=(IntPtr)99; if(up&&key==failKeyUp)throw new Exception("key release interrupted"); if(!up&&key==failKey)throw new Exception("key interrupted"); }
  public static bool PostMessage(IntPtr h,uint m,IntPtr w,IntPtr l) { events.Add("post:"+m); lastLParam=l.ToInt64(); return postWorks; }
+ public static bool ScreenToClient(IntPtr h, ref POINT p) { return true; }
 }
 "@
 $MOUSEEVENTF_LEFTDOWN=2; $MOUSEEVENTF_LEFTUP=4
@@ -49,6 +50,8 @@ function Refuses($call,$pattern) {
 }
 function Reset {
  $env:OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS="1"
+ # pi-phone fork: physical input also needs this call's headed: true.
+ $script:HeadedThisCall=$true
  [OCUWin32]::foreground=[IntPtr]42; [OCUWin32]::root=[IntPtr]42
  [OCUWin32]::focusWorks=$true; [OCUWin32]::moveWorks=$true; [OCUWin32]::held=$false
  [OCUWin32]::moves=0; [OCUWin32]::failMoveAt=0; [OCUWin32]::failKey=0; [OCUWin32]::failKeyUp=0; [OCUWin32]::loseFocusAfterKey=0; [OCUWin32]::keyUps=0
@@ -58,6 +61,15 @@ Reset
 $env:OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=""
 Refuses { Send-GlobalMouseClick 42 30 40 "left" 1 $bounds } "requires"
 Assert ([OCUWin32]::moves -eq 0 -and [OCUWin32]::events.Count -eq 0) "Gate moved pointer or sent input"
+Reset
+# pi-phone fork: with the environment gate on, a call without headed: true still sends no physical input;
+# a drag or a wheel falls back to window messages.
+$script:HeadedThisCall=$false
+Refuses { Send-GlobalMouseClick 42 30 40 "left" 1 $bounds } "headed"
+Refuses { Send-Key 42 "ctrl+a" "global" } "headed"
+Send-Drag 42 30 40 50 60 $bounds
+Send-Scroll 42 30 40 "down" 1 $bounds
+Assert ([OCUWin32]::moves -eq 0 -and -not (([OCUWin32]::events -join ",") -match "mouse:|key:")) "Physical input without headed"
 Reset
 Refuses { Send-GlobalMouseClick 42 30 40 "unknown" 1 $bounds } "Unsupported global mouse button"
 Refuses { Send-GlobalMouseClick 42 30 40 "left" 10000 $bounds } "between 1 and 3"

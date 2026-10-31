@@ -6,6 +6,7 @@ param([Parameter(Mandatory = $true)][string]$NativePath)
 # - A second, topmost window over part of the fixture: its part is reported ("Covered: [...]") and black
 #   in the screenshot (no red pixels of the cover); refuse_if_covered refuses; a click there is refused.
 #   Over the whole fixture: no screenshot, and the reason.
+# - drag, coordinate clicks and key_method global without headed: true are refused (policy_denied).
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "windows-fixture-state.ps1")
 if ($env:OS -ne "Windows_NT") { throw "Windows desktop required" }
@@ -155,6 +156,13 @@ try {
     Assert ((Text $old) -match "replaced by $(Snapshot-Of $second)") (Text $old)
     Write-Output "An old snapshot id is refused with stale_ref."
 
+    # Physical or coordinate input without headed: true.
+    $state = Call-Tool "get_app_state" @{}
+    foreach ($call in @(@("drag", @{ from_x = 40; from_y = 60; to_x = 120; to_y = 60 }), @("click", @{ x = 40; y = 60 }), @("press_key", @{ key = "ctrl+a"; key_method = "global" }))) {
+        Assert-Code (Call-Tool $call[0] $call[1]) "policy_denied" "$($call[0]) without headed"
+    }
+    Write-Output "drag, a coordinate click and key_method global without headed are refused with policy_denied."
+
     # A window over part of the fixture.
     Start-Cover 380 180 250 150
     $covered = Call-Tool "get_app_state" @{}
@@ -179,7 +187,7 @@ try {
     } finally { $bitmap.Dispose() }
     Write-Output "Covered part $x,$y ${width}x$height is reported and black; no cover pixels in the screenshot."
     Assert-Code (Call-Tool "get_app_state" @{ refuse_if_covered = $true }) "covered" "refuse_if_covered"
-    Assert-Code (Call-Tool "click" @{ x = ($x + 10); y = ($y + 10) }) "covered" "A click in the covered part"
+    Assert-Code (Call-Tool "click" @{ x = ($x + 10); y = ($y + 10); headed = $true }) "covered" "A click in the covered part"
     Write-Output "refuse_if_covered and a click in the covered part are refused with covered."
 
     # A window over all of it.

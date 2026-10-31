@@ -1395,11 +1395,17 @@ def perform_operation(operation):
     element = find_element(app, element_record, window)
     # pi-phone fork: only this call's own opt-out counts (exactly true), never a default.
     allow_password = operation.get("allow_password_input") is True
+    headed = operation.get("headed") is True
 
     def physical_point(x, y):
         # pi-phone fork: real pointer input lands on whatever is on top at that point.
         refuse_covered_points(app, window, bounds, [(x, y)])
         return x, y
+
+    if tool in ("drag",) or (tool == "click" and (element_record is None or operation.get("click_method") == "global")):
+        if not headed:
+            raise OCUError("policy_denied", "Refused: {} is physical input and needs headed: true on the call.".format(
+                "drag" if tool == "drag" else "a coordinate or global click"))
 
     if tool == "click":
         click_method = (operation.get("click_method") or "auto").lower()

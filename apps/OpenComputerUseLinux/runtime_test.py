@@ -442,8 +442,8 @@ class RuntimeActionReadBackTests(unittest.TestCase):
 
     def test_all_actions_skip_snapshot_and_settle_when_requested(self):
         for tool, arguments in (
-            ("click", {"x": 1, "y": 2}),
-            ("drag", {"from_x": 1, "from_y": 2, "to_x": 3, "to_y": 4}),
+            ("click", {"x": 1, "y": 2, "headed": True}),
+            ("drag", {"from_x": 1, "from_y": 2, "to_x": 3, "to_y": 4, "headed": True}),
             ("press_key", {"key": "Return"}),
             ("type_text", {"text": "hello"}),
             ("set_value", {"value": "hello"}),
@@ -828,6 +828,40 @@ class StaleRefTests(unittest.TestCase):
         self.assertEqual(self.runtime.window_id_of(app, window), "42:6")
         window.path = None
         self.assertEqual(self.runtime.window_id_of(app, window), "")
+
+
+class HeadedInputTests(unittest.TestCase):
+    """pi-phone fork: drag and coordinate or global clicks need headed: true on the call."""
+
+    def setUp(self):
+        self.runtime = load_runtime()
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.object(self.runtime, "resolve_target", return_value=(object(), 0, object())))
+        self.stack.enter_context(mock.patch.object(self.runtime, "extents", return_value=rect(0, 0, 400, 300)))
+        self.stack.enter_context(mock.patch.object(self.runtime, "find_element", return_value=None))
+        self.stack.enter_context(mock.patch.object(self.runtime, "refuse_covered_points"))
+        self.click = self.stack.enter_context(mock.patch.object(self.runtime, "send_mouse_click"))
+        self.drag = self.stack.enter_context(mock.patch.object(self.runtime, "send_drag"))
+
+    def test_physical_input_without_headed_is_refused(self):
+        for operation in ({"tool": "drag", "from_x": 1, "from_y": 2, "to_x": 3, "to_y": 4},
+                          {"tool": "click", "x": 5, "y": 6},
+                          {"tool": "click", "x": 5, "y": 6, "headed": "true"},
+                          {"tool": "click", "element": {"index": 1}, "click_method": "global"}):
+            with self.subTest(operation=operation):
+                with self.assertRaises(self.runtime.OCUError) as refused:
+                    self.runtime.perform_operation({"app": "demo", "skip_read_back": True, **operation})
+                self.assertEqual(refused.exception.code, "policy_denied")
+        self.click.assert_not_called()
+        self.drag.assert_not_called()
+
+    def test_headed_physical_input_goes_through(self):
+        self.runtime.perform_operation({"app": "demo", "skip_read_back": True, "tool": "drag", "headed": True,
+                                        "from_x": 1, "from_y": 2, "to_x": 3, "to_y": 4})
+        self.runtime.perform_operation({"app": "demo", "skip_read_back": True, "tool": "click", "headed": True, "x": 5, "y": 6})
+        self.drag.assert_called_once_with(1, 2, 3, 4)
+        self.click.assert_called_once()
 
 
 class ErrorCodeTests(unittest.TestCase):
